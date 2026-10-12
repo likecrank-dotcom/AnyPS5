@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <list>
 #include <mutex>
+#include <optional>
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
@@ -108,9 +109,28 @@ void ValidateProvokingVertex(const Context& context, const State& state, std::sp
     for (const auto& shader : shaders) {
         if (shader.stage != ShaderRecompiler::ShaderStage::Fragment) continue;
         Require(shader.program != nullptr, "missing compiled fragment shader");
-        Require(std::none_of(shader.program->fragmentParameters.begin(), shader.program->fragmentParameters.end(), [](const ShaderRecompiler::FragmentParameter& parameter) { return parameter.flat && parameter.perVertex; }), "last provoking vertex with explicit per-vertex flat interpolation is unsupported");
         Require(state.topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP || std::none_of(shader.program->fragmentParameters.begin(), shader.program->fragmentParameters.end(), [](const ShaderRecompiler::FragmentParameter& parameter) { return parameter.perVertex; }), "last provoking vertex with explicit per-vertex triangle-strip interpolation is unsupported");
     }
+}
+
+std::uint32_t FlatP0VertexIndex(const State& state) {
+    if (state.provokingVertexMode == VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT) return 0u;
+    switch (state.topology) {
+    case VK_PRIMITIVE_TOPOLOGY_POINT_LIST: return 0u;
+    case VK_PRIMITIVE_TOPOLOGY_LINE_LIST:
+    case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP: return 1u;
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST:
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN: return 2u;
+    default: throw std::runtime_error("AGC graphics: flat P0 per-vertex input has no provoking vertex index for this topology");
+    }
+}
+
+std::optional<ShaderRecompiler::PipelineSpecializationConstant> FlatP0VertexSpecialization(const CompiledShader& shader, const State& state) {
+    if (shader.stage != ShaderRecompiler::ShaderStage::Fragment || shader.program == nullptr) return std::nullopt;
+    const auto found = std::find_if(shader.program->specialization.begin(), shader.program->specialization.end(), [](const auto& constant) { return constant.id == ShaderRecompiler::PipelineSpecialization::FlatP0VertexIndex; });
+    if (found == shader.program->specialization.end()) return std::nullopt;
+    Require(std::any_of(shader.program->fragmentParameters.begin(), shader.program->fragmentParameters.end(), [](const auto& parameter) { return parameter.flat && parameter.perVertex; }), "flat P0 vertex specialization has no matching fragment input");
+    return ShaderRecompiler::PipelineSpecializationConstant{found->id, FlatP0VertexIndex(state)};
 }
 
 bool ValidateSampleLocations(const Context& context, const State& state) {
@@ -182,6 +202,7 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
         appendKey(key, shader.stage);
         appendKey(key, shader.program->PipelineVariantId());
         appendKey(key, shader.pushConstantOffset);
+        if (const auto provokingVertex = FlatP0VertexSpecialization(shader, state)) appendKey(keys.fragmentShader, provokingVertex->value);
     }
     for (const auto& binding : input.bindings) {
         appendKey(keys.vertexInput, binding.binding);
@@ -306,7 +327,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
             stages[i].module = _modules[i];
             stages[i].pName = "main";
             if (shaders[i].stage == ShaderRecompiler::ShaderStage::Mesh && context.meshWave32 && shader.hostSubgroupSize == 32u) stages[i].pNext = &meshSubgroup;
-            specializations.emplace_back(shader);
+            specializations.emplace_back(shader, FlatP0VertexSpecialization(shaders[i], state));
             stages[i].pSpecializationInfo = specializations.back().Info();
         }
         // A descriptor set layout with the same bindings as this one is compatible with the pipeline

@@ -3983,6 +3983,13 @@ void ProvokingVertexTests() {
     const std::array<CompiledShader, 1> flatP10Shaders{{{ShaderRecompiler::ShaderStage::Fragment, &flatP10Pixel, 0}}};
     ValidateProvokingVertex(supported, last, flatP10Shaders);
     expectFailure([&] { ValidateProvokingVertex(supported, first, flatP10Shaders); }, "v_interp_mov p10 of a flat input with the first provoking vertex is not measured");
+    const std::array<std::uint32_t, 7> flatP20Color{0xc8120002u, 0xc8160102u, 0xc81a0202u, 0xc81e0001u, 0xf800180fu, 0x07060504u, 0xbf810000u};
+    const auto flatP20Pixel = recompilePixel({0x400u}, flatP20Color);
+    const auto flatP20Inputs = locatedInputs(flatP20Pixel.spirv.Words());
+    Require(flatP20Inputs.size() == 1 && flatP20Inputs[0].location == 0 && !flatP20Inputs[0].flat && flatP20Inputs[0].perVertex, "flat P0/P20 did not compile to a per-vertex input");
+    Require(flatP20Pixel.fragmentParameters.size() == 1 && flatP20Pixel.fragmentParameters[0].flat && flatP20Pixel.fragmentParameters[0].perVertex, "flat P0/P20 metadata did not retain both access modes");
+    const std::array<CompiledShader, 1> flatP20Shaders{{{ShaderRecompiler::ShaderStage::Fragment, &flatP20Pixel, 0}}};
+    ValidateProvokingVertex(supported, last, flatP20Shaders);
     ShaderRecompiler::RecompileResult fragment{};
     const std::array<CompiledShader, 1> shaders{{{ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
     for (const auto topology : {VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN}) {
@@ -3994,9 +4001,7 @@ void ProvokingVertexTests() {
                 auto firstState = state;
                 firstState.provokingVertexMode = VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT;
                 ValidateProvokingVertex(unsupported, firstState, shaders);
-                if (flat && perVertex) {
-                    expectFailure([&] { ValidateProvokingVertex(supported, state, shaders); }, "last provoking vertex with explicit per-vertex flat interpolation is unsupported");
-                } else if (perVertex && topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP) {
+                if (perVertex && topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP) {
                     expectFailure([&] { ValidateProvokingVertex(supported, state, shaders); }, "last provoking vertex with explicit per-vertex triangle-strip interpolation is unsupported");
                 } else {
                     ValidateProvokingVertex(supported, state, shaders);

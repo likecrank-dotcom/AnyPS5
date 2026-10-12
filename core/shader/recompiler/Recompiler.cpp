@@ -515,6 +515,7 @@ struct SpecializedModule {
     std::uint64_t specializationId = 0;
     SharedSpirv spirv;
     std::vector<std::uint32_t> bindings;
+    std::vector<PipelineSpecializationConstant> specialization;
     bool pushData = false;
 };
 
@@ -526,6 +527,7 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
     }
     std::map<std::uint32_t, std::uint32_t> values;
     std::set<std::uint32_t> specializedIds;
+    std::set<std::uint32_t> runtimeValueIds;
     const auto& words = source.Words();
     if (words.size() < 5u || words[0] != spv::MagicNumber) throw std::runtime_error("invalid prepared specialization module");
     for (std::size_t cursor = 5; cursor < words.size();) {
@@ -533,9 +535,13 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
         const auto op = static_cast<spv::Op>(words[cursor] & 0xffffu);
         if (count == 0u || count > words.size() - cursor) throw std::runtime_error("truncated prepared specialization instruction");
         if (op == spv::OpDecorate && count == 4u && words[cursor + 2u] == spv::DecorationSpecId) {
-            const auto found = supplied.find(words[cursor + 3u]);
-            if (found == supplied.end() || !values.emplace(words[cursor + 1u], found->second).second) throw std::runtime_error("missing or duplicate prepared specialization value");
-            specializedIds.insert(found->first);
+            if (words[cursor + 3u] == PipelineSpecialization::FlatP0VertexIndex) {
+                if (supplied.contains(words[cursor + 3u]) || !runtimeValueIds.insert(words[cursor + 1u]).second) throw std::runtime_error("duplicate runtime provoking vertex specialization");
+            } else {
+                const auto found = supplied.find(words[cursor + 3u]);
+                if (found == supplied.end() || !values.emplace(words[cursor + 1u], found->second).second) throw std::runtime_error("missing or duplicate prepared specialization value");
+                specializedIds.insert(found->first);
+            }
         }
         cursor += count;
     }
@@ -544,9 +550,16 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
         const auto count = words[cursor] >> 16u;
         const auto op = static_cast<spv::Op>(words[cursor] & 0xffffu);
         if (op == spv::OpSpecConstant) {
-            if (count != 4u || !values.contains(words[cursor + 2u])) throw std::runtime_error("invalid prepared specialization constant");
-            materialized.insert(materialized.end(), {(4u << 16u) | spv::OpConstant, words[cursor + 1u], words[cursor + 2u], values.at(words[cursor + 2u])});
-        } else if (!(op == spv::OpDecorate && count == 4u && words[cursor + 2u] == spv::DecorationSpecId)) {
+            if (count != 4u) throw std::runtime_error("invalid prepared specialization constant");
+            if (runtimeValueIds.contains(words[cursor + 2u])) {
+                materialized.insert(materialized.end(), words.begin() + cursor, words.begin() + cursor + count);
+            } else {
+                if (!values.contains(words[cursor + 2u])) throw std::runtime_error("invalid prepared specialization constant");
+                materialized.insert(materialized.end(), {(4u << 16u) | spv::OpConstant, words[cursor + 1u], words[cursor + 2u], values.at(words[cursor + 2u])});
+            }
+        } else if (op == spv::OpDecorate && count == 4u && words[cursor + 2u] == spv::DecorationSpecId) {
+            if (runtimeValueIds.contains(words[cursor + 1u])) materialized.insert(materialized.end(), words.begin() + cursor, words.begin() + cursor + count);
+        } else {
             materialized.insert(materialized.end(), words.begin() + cursor, words.begin() + cursor + count);
         }
         cursor += count;
@@ -601,6 +614,7 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
         cursor += count;
     }
     module->spirv = std::move(materialized);
+    if (!runtimeValueIds.empty()) module->specialization.push_back({PipelineSpecialization::FlatP0VertexIndex, 0u});
     module->specializationId = constants.empty() ? 0u : nextVariantId();
     return module;
 }
@@ -845,6 +859,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         if (entry->failure) std::rethrow_exception(entry->failure);
         const auto& module = entry->module;
         result.specializationId = module->specializationId;
+        result.specialization = module->specialization;
         result.spirv = module->spirv;
         bindingPlan = &entry->bindings;
     } else {

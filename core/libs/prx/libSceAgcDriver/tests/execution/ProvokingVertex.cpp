@@ -3,6 +3,7 @@
 #include "VulkanTestDevice.hpp"
 #include "ProvokingVertex_vert_spv.h"
 #include "ProvokingVertex_frag_spv.h"
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -58,6 +59,29 @@ ShaderRecompiler::RecompileResult GuestPixel(const ShaderRecompiler::SpirvTarget
     return result;
 }
 
+ShaderRecompiler::RecompileResult GuestFlatPerVertexPixel(const ShaderRecompiler::SpirvTarget& target) {
+    alignas(256) static constexpr std::array<std::uint32_t, 7> code{0xc8120002u, 0xc8160102u, 0xc81a0202u, 0xc81e0001u, 0xf800180fu, 0x07060504u, 0xbf810000u};
+    ShaderRecompiler::ShaderPixelStageInfo pixel{};
+    pixel.interpolatorCount = 1;
+    pixel.interpolatorSettings[0] = 0x400u;
+    pixel.inputAddr = 2;
+    pixel.hasPerspectiveCenterVgpr = true;
+    pixel.targetOutputMode[0] = 9;
+    pixel.targetExportMapping.fill(0xe4u);
+    ShaderRecompiler::RecompileRequest request{};
+    request.shader = {ShaderRecompiler::ShaderStage::Fragment, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}};
+    request.context.waveSize = 64;
+    request.context.pixel = pixel;
+    request.target = target;
+    request.layout = PixelPushLayout(0u, target);
+    request.useCache = false;
+    auto result = ShaderRecompiler::Recompile(request);
+    result.variantId = 4;
+    Require(result.fragmentParameters.size() == 1 && result.fragmentParameters[0].flat && result.fragmentParameters[0].perVertex, "flat P0/P20 fixture did not produce a flat per-vertex input");
+    Require(std::any_of(result.specialization.begin(), result.specialization.end(), [](const auto& constant) { return constant.id == ShaderRecompiler::PipelineSpecialization::FlatP0VertexIndex; }), "flat P0/P20 fixture did not retain the provoking-vertex specialization");
+    return result;
+}
+
 void CheckPixel(std::uint32_t x, std::uint32_t y, const Color& expected, const std::string& name) {
     for (std::uint32_t channel = 0; channel < expected.size(); ++channel) {
         const auto actual = std::to_integer<unsigned>(Pixels[(y * Width + x) * 4 + channel]);
@@ -65,7 +89,7 @@ void CheckPixel(std::uint32_t x, std::uint32_t y, const Color& expected, const s
     }
 }
 
-void Run(AgcDriver::VulkanDevice& device, VkPrimitiveTopology topology, std::span<const AgcDriver::Graphics::CompiledShader> shaders, bool useLast = true, std::string_view shaderName = "GLSL") {
+void Run(AgcDriver::VulkanDevice& device, VkPrimitiveTopology topology, std::span<const AgcDriver::Graphics::CompiledShader> shaders, bool useLast = true, std::string_view shaderName = "GLSL", bool zeroAlpha = false) {
     Pixels.fill(Sentinel);
     AgcDriver::Graphics::State state{};
     state.stages.path = AgcDriver::Graphics::ShaderPath::Vertex;
@@ -89,8 +113,12 @@ void Run(AgcDriver::VulkanDevice& device, VkPrimitiveTopology topology, std::spa
     const auto name = std::string(shaderName) + (strip ? " triangle strip" : " triangle list");
     for (std::uint32_t panel = 0; panel < 3; ++panel) {
         const bool last = panel == 1 && useLast;
-        const auto firstTriangle = last ? Blue : Red;
-        const auto secondTriangle = strip ? (last ? Yellow : Green) : (last ? Magenta : Yellow);
+        auto firstTriangle = last ? Blue : Red;
+        auto secondTriangle = strip ? (last ? Yellow : Green) : (last ? Magenta : Yellow);
+        if (zeroAlpha) {
+            firstTriangle[3] = 0;
+            secondTriangle[3] = 0;
+        }
         for (std::uint32_t offset = 0; offset < 4; ++offset) {
             CheckPixel(panel * Panel + 16 + offset, 16, firstTriangle, name);
             CheckPixel(panel * Panel + 48 - offset, 48, secondTriangle, name);
@@ -133,6 +161,12 @@ int main() {
             {ShaderRecompiler::ShaderStage::Fragment, &guestPixel, PixelPushOffset(0u, device->Target())}
         }};
         for (const auto topology : {VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP}) Run(*device, topology, guestShaders, true, "guest P0");
+        const auto flatPerVertexPixel = GuestFlatPerVertexPixel(device->Target());
+        const std::array<AgcDriver::Graphics::CompiledShader, 2> flatPerVertexShaders{{
+            {ShaderRecompiler::ShaderStage::Vertex, &vertex, 0},
+            {ShaderRecompiler::ShaderStage::Fragment, &flatPerVertexPixel, PixelPushOffset(0u, device->Target())}
+        }};
+        Run(*device, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, flatPerVertexShaders, true, "guest flat per-vertex P0", true);
         std::puts("provoking vertex rendering tests passed: GLSL and guest P0, triangle list and strip, first/last/first");
         return 0;
     } catch (const std::exception& error) {

@@ -2,8 +2,10 @@
 #define CORE_LIBS_AGCDRIVER_GRAPHICS_PIPELINESPECIALIZATION_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
+#include <algorithm>
 #include <limits>
 #include <map>
+#include <optional>
 #include <set>
 #include <spirv/unified1/spirv.hpp>
 #include <vector>
@@ -13,6 +15,10 @@ namespace AgcDriver::Graphics {
 class PipelineSpecialization {
 public:
     static void Validate(const ShaderRecompiler::RecompileResult& shader) {
+        Validate(shader, shader.specialization);
+    }
+
+    static void Validate(const ShaderRecompiler::RecompileResult& shader, std::span<const ShaderRecompiler::PipelineSpecializationConstant> specialization) {
         const auto& words = shader.spirv;
         Require(words.size() >= 5 && words[0] == spv::MagicNumber && words[3] != 0, "invalid specialization module header");
         std::set<std::uint32_t> unsignedTypes;
@@ -20,7 +26,7 @@ public:
         std::map<std::uint32_t, std::uint32_t> decorations;
         std::set<std::uint32_t> constantIds;
         std::set<std::uint32_t> supplied;
-        for (const auto& constant : shader.specialization) Require(supplied.insert(constant.id).second, "duplicate pipeline specialization ID");
+        for (const auto& constant : specialization) Require(supplied.insert(constant.id).second, "duplicate pipeline specialization ID");
         for (std::size_t cursor = 5; cursor < words.size();) {
             const auto count = words[cursor] >> 16u;
             const auto op = static_cast<spv::Op>(words[cursor] & 0xffffu);
@@ -50,23 +56,29 @@ public:
         }
     }
 
-    explicit PipelineSpecialization(const ShaderRecompiler::RecompileResult& shader) {
-        Validate(shader);
-        entries.reserve(shader.specialization.size());
-        for (std::size_t index = 0; index < shader.specialization.size(); ++index) {
+    explicit PipelineSpecialization(const ShaderRecompiler::RecompileResult& shader, std::optional<ShaderRecompiler::PipelineSpecializationConstant> override = std::nullopt) : values(shader.specialization) {
+        if (override) {
+            const auto found = std::find_if(values.begin(), values.end(), [&](const auto& constant) { return constant.id == override->id; });
+            Require(found != values.end(), "pipeline override refers to an absent specialization ID");
+            found->value = override->value;
+        }
+        Validate(shader, values);
+        entries.reserve(values.size());
+        for (std::size_t index = 0; index < values.size(); ++index) {
             const auto offset = index * sizeof(ShaderRecompiler::PipelineSpecializationConstant) + offsetof(ShaderRecompiler::PipelineSpecializationConstant, value);
             Require(offset <= std::numeric_limits<std::uint32_t>::max(), "pipeline specialization offset exceeds Vulkan limits");
-            entries.push_back({shader.specialization[index].id, static_cast<std::uint32_t>(offset), sizeof(std::uint32_t)});
+            entries.push_back({values[index].id, static_cast<std::uint32_t>(offset), sizeof(std::uint32_t)});
         }
         info.mapEntryCount = static_cast<std::uint32_t>(entries.size());
         info.pMapEntries = entries.data();
-        info.dataSize = shader.specialization.size() * sizeof(ShaderRecompiler::PipelineSpecializationConstant);
-        info.pData = shader.specialization.data();
+        info.dataSize = values.size() * sizeof(ShaderRecompiler::PipelineSpecializationConstant);
+        info.pData = values.data();
     }
 
     [[nodiscard]] const VkSpecializationInfo* Info() const { return entries.empty() ? nullptr : &info; }
 
 private:
+    std::vector<ShaderRecompiler::PipelineSpecializationConstant> values;
     std::vector<VkSpecializationMapEntry> entries;
     VkSpecializationInfo info{};
 };

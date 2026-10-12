@@ -128,13 +128,21 @@ std::uint32_t EmitAttributeValue(SpirvEmitterState& state, std::uint32_t attr, s
         state.module.AddFunction(spv::OpLoad, TypeF32(state), value, pointer);
         return value;
     };
+    const auto loadPerVertexIndex = [&](std::uint32_t vertex) {
+        const auto pointer = state.module.AllocateId();
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpAccessChain, TypePointer(state, spv::StorageClassInput, TypeF32(state)), pointer, input->variableId, vertex, ConstantU32(state, chan & 3u));
+        state.module.AddFunction(spv::OpLoad, TypeF32(state), value, pointer);
+        return value;
+    };
     if (input->perVertex) {
         if (state.inputInfo.pixel == nullptr) {
             throw std::runtime_error("pixel input info is missing for a per-vertex attribute");
         }
         if (PixelParameterIsFlat(state, attr)) {
             const auto bits = state.module.AllocateId();
-            state.module.AddFunction(spv::OpBitcast, TypeU32(state), bits, loadPerVertex(0u));
+            const auto vertex = state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::FlatP0VertexIndex, 0u);
+            state.module.AddFunction(spv::OpBitcast, TypeU32(state), bits, loadPerVertexIndex(vertex));
             return bits;
         }
         const auto barycentricKind = PixelParameterIsLinear(state, attr) ? StageInputKind::BaryCoordNoPerspective : StageInputKind::BaryCoordSmooth;
@@ -189,8 +197,18 @@ std::uint32_t EmitInterpolationParameterValue(SpirvEmitterState& state, std::uin
         state.module.AddFunction(spv::OpLoad, TypeF32(state), value, pointer);
         return value;
     };
+    const auto loadVertexIndex = [&](std::uint32_t vertex) {
+        const auto pointer = state.module.AllocateId();
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpAccessChain, TypePointer(state, spv::StorageClassInput, TypeF32(state)), pointer, input->variableId, vertex, ConstantU32(state, chan & 3u));
+        state.module.AddFunction(spv::OpLoad, TypeF32(state), value, pointer);
+        return value;
+    };
+    const auto provokingVertex = PixelParameterIsFlat(state, attr) && mode == 2u;
     const auto selectedVertex = (mode + 1u) % 3u;
-    std::uint32_t value = loadVertex(selectedVertex);
+    std::uint32_t value = provokingVertex
+        ? loadVertexIndex(state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::FlatP0VertexIndex, 0u))
+        : loadVertex(selectedVertex);
     if (!PixelParameterIsCustom(state, attr) && mode < 2u) {
         const auto delta = state.module.AllocateId();
         state.module.AddFunction(spv::OpFSub, TypeF32(state), delta, value, loadVertex(0u));
