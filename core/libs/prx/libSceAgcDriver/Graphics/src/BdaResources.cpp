@@ -149,8 +149,12 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
         Require(rangeWords <= std::numeric_limits<std::uint32_t>::max() - bitmapWords, "BDA written-page bitmap size overflow");
         bitmapWords += rangeWords;
     }
-    Require(bitmapWords <= (std::numeric_limits<std::size_t>::max() - ShaderRecompiler::BdaAbi::FaultBufferBytes) / sizeof(std::uint32_t), "BDA fault buffer size overflow");
-    faultBytes = ShaderRecompiler::BdaAbi::FaultBufferBytes + static_cast<std::size_t>(bitmapWords) * sizeof(std::uint32_t);
+    const auto summaryWords = ShaderRecompiler::BdaAbi::WrittenSummaryWordCount(bitmapWords);
+    const auto maxWords = std::numeric_limits<std::size_t>::max() / sizeof(std::uint32_t);
+    Require(bitmapWords <= maxWords - ShaderRecompiler::BdaAbi::WrittenBitmapWord, "BDA fault buffer size overflow");
+    Require(summaryWords <= maxWords - ShaderRecompiler::BdaAbi::WrittenBitmapWord - bitmapWords, "BDA fault buffer size overflow");
+    const auto totalWords = ShaderRecompiler::BdaAbi::WrittenBitmapWord + summaryWords + bitmapWords;
+    faultBytes = static_cast<std::size_t>(totalWords) * sizeof(std::uint32_t);
     Require(tableBytes <= context.limits.maxStorageBufferRange && faultBytes <= context.limits.maxStorageBufferRange, "BDA descriptors exceed storage buffer range limit");
     fault = std::make_unique<Buffer>(context, faultBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     std::memset(fault->Bytes().data(), 0, faultBytes);
@@ -301,7 +305,9 @@ void BdaResources::markWrittenPages() const {
     if (!ranges.empty()) std::memcpy(ranges.data(), table->Bytes().data() + sizeof(header), ranges.size() * sizeof(ranges.front()));
     const auto wordCount = faultBytes / sizeof(std::uint32_t);
     Require(Abi::ForEachWrittenRange(header, ranges, words, wordCount, [](std::uint64_t address, std::size_t bytes) { GuestMemory::MarkWritten(address, bytes); }), "invalid BDA written-page bitmap");
-    if (header.reserved != 0) std::memset(words + Abi::WrittenBitmapWord, 0, static_cast<std::size_t>(header.reserved) * sizeof(std::uint32_t));
+    const auto summaryWords = Abi::WrittenSummaryWordCount(header.reserved);
+    const auto dirtyWords = summaryWords + header.reserved;
+    if (dirtyWords != 0) std::memset(words + Abi::WrittenSummaryWord, 0, static_cast<std::size_t>(dirtyWords) * sizeof(std::uint32_t));
     words[Abi::WrittenOverflowWord] = 0;
 }
 

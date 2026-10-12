@@ -199,16 +199,29 @@ static std::uint32_t DefineBdaNoteWrite(SpirvEmitterState& state) {
         const auto bitmapWordDelta = Unary(state, spv::OpUConvert, u32, binary(spv::OpShiftRightLogical, u64, pageDelta, BdaConstant(state, 5)));
         const auto bitmapIndex = binary(spv::OpIAdd, u32, bitmapOffset, bitmapWordDelta);
         const auto bitmapCount = BdaLoadWord(state, constant(3));
+        const auto summaryRemainder = binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, bitmapCount, constant(31u)), constant(0u));
+        const auto summaryRoundUp = state.module.AllocateId();
+        state.module.AddFunction(spv::OpSelect, u32, summaryRoundUp, summaryRemainder, constant(1u), constant(0u));
+        const auto summaryWordCount = binary(spv::OpIAdd, u32,
+            binary(spv::OpShiftRightLogical, u32, bitmapCount, constant(5u)), summaryRoundUp);
+        const auto pageBitmapStart = binary(spv::OpIAdd, u32, constant(BdaAbi::WrittenBitmapWord), summaryWordCount);
         const auto faultLength = state.module.AllocateId();
         state.module.AddFunction(spv::OpArrayLength, u32, faultLength, state.faultBufferVariable, 0u);
-        const auto faultHasBitmap = binary(spv::OpLogicalAnd, boolean, binary(spv::OpUGreaterThan, boolean, faultLength, constant(BdaAbi::WrittenBitmapWord)), binary(spv::OpULessThan, boolean, bitmapIndex, binary(spv::OpISub, u32, faultLength, constant(BdaAbi::WrittenBitmapWord))));
+        const auto faultHasBitmap = binary(spv::OpLogicalAnd, boolean, binary(spv::OpUGreaterThan, boolean, faultLength, pageBitmapStart), binary(spv::OpULessThan, boolean, bitmapIndex, binary(spv::OpISub, u32, faultLength, pageBitmapStart)));
         const auto tableHasBitmap = binary(spv::OpULessThan, boolean, bitmapIndex, bitmapCount);
         const auto inBounds = binary(spv::OpLogicalAnd, boolean, tableHasBitmap, faultHasBitmap);
         EmitIfCondition(state, inBounds, [&] {
-            const auto wordIndex = binary(spv::OpIAdd, u32, constant(BdaAbi::WrittenBitmapWord), bitmapIndex);
+            const auto wordIndex = binary(spv::OpIAdd, u32, pageBitmapStart, bitmapIndex);
             const auto bitIndex = Unary(state, spv::OpUConvert, u32, binary(spv::OpBitwiseAnd, u64, pageDelta, BdaConstant(state, 31)));
             const auto bit = binary(spv::OpShiftLeftLogical, u32, constant(1u), bitIndex);
-            state.module.AddFunction(spv::OpAtomicOr, u32, state.module.AllocateId(), BdaWord(state, state.faultBufferVariable, wordIndex), scope, relaxed, bit);
+            const auto previous = state.module.AllocateId();
+            state.module.AddFunction(spv::OpAtomicOr, u32, previous, BdaWord(state, state.faultBufferVariable, wordIndex), scope, relaxed, bit);
+            EmitIfCondition(state, binary(spv::OpIEqual, boolean, previous, constant(0u)), [&] {
+                const auto summaryIndex = binary(spv::OpIAdd, u32, constant(BdaAbi::WrittenSummaryWord), binary(spv::OpShiftRightLogical, u32, bitmapIndex, constant(5u)));
+                const auto summaryBitIndex = binary(spv::OpBitwiseAnd, u32, bitmapIndex, constant(31u));
+                const auto summaryBit = binary(spv::OpShiftLeftLogical, u32, constant(1u), summaryBitIndex);
+                state.module.AddFunction(spv::OpAtomicOr, u32, state.module.AllocateId(), BdaWord(state, state.faultBufferVariable, summaryIndex), scope, relaxed, summaryBit);
+            });
         });
         EmitIfCondition(state, Unary(state, spv::OpLogicalNot, boolean, inBounds), [&] {
             state.module.AddFunction(spv::OpAtomicStore, BdaWord(state, state.faultBufferVariable, constant(BdaAbi::WrittenOverflowWord)), scope, relaxed, constant(1u));

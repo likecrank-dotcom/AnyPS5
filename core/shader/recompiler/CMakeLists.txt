@@ -219,6 +219,7 @@ function(add_shader_recompiler target runtimeTarget)
             BuildPreparedShaderKey
             BuildRectListShaders
             BdaAbi::WrittenBitmapWordCount
+            BdaAbi::WrittenSummaryWordCount
             CaptureResources
             DebugProbeActive
             DepthBitsTextureWidth

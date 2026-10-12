@@ -9,7 +9,7 @@
 
 namespace ShaderRecompiler::BdaAbi {
 
-inline constexpr std::uint32_t Version = 2;
+inline constexpr std::uint32_t Version = 3;
 inline constexpr std::uint32_t Read = 1;
 inline constexpr std::uint32_t Write = 2;
 
@@ -50,8 +50,9 @@ static_assert(offsetof(Fault, address) == 8 && offsetof(Fault, instruction) == 2
 inline constexpr std::uint32_t WrittenPageShift = 12;
 inline constexpr std::uint64_t WrittenAddressLimit = std::uint64_t{1} << 48;
 inline constexpr std::uint32_t WrittenOverflowWord = sizeof(Fault) / sizeof(std::uint32_t);
-inline constexpr std::size_t FaultBufferBytes = (WrittenOverflowWord + 1u) * sizeof(std::uint32_t);
-inline constexpr std::uint32_t WrittenBitmapWord = static_cast<std::uint32_t>(FaultBufferBytes / sizeof(std::uint32_t));
+inline constexpr std::uint32_t WrittenSummaryWord = WrittenOverflowWord + 1u;
+inline constexpr std::size_t FaultBufferBytes = WrittenSummaryWord * sizeof(std::uint32_t);
+inline constexpr std::uint32_t WrittenBitmapWord = WrittenSummaryWord;
 inline constexpr std::uint32_t NoWrittenBitmap = UINT32_MAX;
 inline constexpr std::uint64_t WrittenPageBytes = std::uint64_t{1} << WrittenPageShift;
 static_assert(WrittenBitmapWord * sizeof(std::uint32_t) == FaultBufferBytes);
@@ -65,10 +66,25 @@ inline constexpr std::uint64_t WrittenBitmapWordCount(const Range& range) {
     return (pages + 31u) / 32u;
 }
 
+inline constexpr std::uint64_t WrittenSummaryWordCount(std::uint64_t bitmapWords) {
+    return (bitmapWords + 31u) / 32u;
+}
+
+inline constexpr std::uint64_t WrittenPageBitmapWord(std::uint64_t bitmapWords) {
+    return WrittenBitmapWord + WrittenSummaryWordCount(bitmapWords);
+}
+
 template<typename TMark>
 bool ForEachWrittenRange(const Header& header, std::span<const Range> ranges, const std::uint32_t* words, std::size_t wordCount, TMark&& mark) {
     if (header.version != Version || header.entryBytes != sizeof(Range) || header.count != ranges.size()) return false;
-    if (wordCount < WrittenBitmapWord || header.reserved > wordCount - WrittenBitmapWord) return false;
+    const auto summaryWords = WrittenSummaryWordCount(header.reserved);
+    const auto pageBitmapWord = WrittenPageBitmapWord(header.reserved);
+    if (pageBitmapWord > wordCount || header.reserved > wordCount - pageBitmapWord) return false;
+    const auto summaryBits = static_cast<std::uint32_t>(header.reserved & 31u);
+    if (summaryBits != 0u && summaryWords != 0u) {
+        const auto last = words[WrittenSummaryWord + summaryWords - 1u];
+        if ((last >> summaryBits) != 0u) return false;
+    }
     std::uint64_t expectedBitmapWord = 0;
     std::uint64_t previousEnd = 0;
     for (const auto& range : ranges) {
@@ -85,7 +101,7 @@ bool ForEachWrittenRange(const Header& header, std::span<const Range> ranges, co
         const auto pages = WrittenBitmapPageCount(range);
         const auto finalPageBits = static_cast<std::uint32_t>(pages & 31u);
         if (finalPageBits != 0u && bitmapWords != 0u) {
-            const auto last = words[WrittenBitmapWord + range.reserved + bitmapWords - 1u];
+            const auto last = words[pageBitmapWord + range.reserved + bitmapWords - 1u];
             if ((last >> finalPageBits) != 0u) return false;
         }
     }
@@ -99,16 +115,34 @@ bool ForEachWrittenRange(const Header& header, std::span<const Range> ranges, co
         mark(runBegin, static_cast<std::size_t>(lastPage - runBegin + WrittenPageBytes));
         hasRun = false;
     };
-    for (const auto& range : ranges) {
-        if ((range.permissions & Write) == 0) continue;
-        const auto firstPage = range.begin >> WrittenPageShift;
-        const auto pages = WrittenBitmapPageCount(range);
-        const auto bitmapWords = WrittenBitmapWordCount(range);
-        for (std::uint64_t word = 0; word < bitmapWords; ++word) {
-            auto mask = words[WrittenBitmapWord + range.reserved + word];
+    std::size_t rangeIndex = 0;
+    for (std::uint64_t summary = 0; summary < summaryWords; ++summary) {
+        auto dirtyWords = words[WrittenSummaryWord + summary];
+        while (dirtyWords != 0u) {
+            const auto bit = static_cast<std::uint32_t>(std::countr_zero(dirtyWords));
+            const auto bitmapIndex = summary * 32u + bit;
+            if (bitmapIndex >= header.reserved) return false;
+            while (rangeIndex < ranges.size()) {
+                const auto& range = ranges[rangeIndex];
+                if ((range.permissions & Write) == 0) {
+                    ++rangeIndex;
+                    continue;
+                }
+                const auto rangeEnd = static_cast<std::uint64_t>(range.reserved) + WrittenBitmapWordCount(range);
+                if (bitmapIndex < range.reserved) return false;
+                if (bitmapIndex < rangeEnd) break;
+                ++rangeIndex;
+            }
+            if (rangeIndex >= ranges.size()) return false;
+            const auto& range = ranges[rangeIndex];
+            auto mask = words[pageBitmapWord + bitmapIndex];
+            if (mask == 0u) return false;
+            const auto firstPage = range.begin >> WrittenPageShift;
+            const auto pageWord = bitmapIndex - range.reserved;
+            const auto pages = WrittenBitmapPageCount(range);
             while (mask != 0u) {
-                const auto bit = static_cast<std::uint32_t>(std::countr_zero(mask));
-                const auto pageIndex = word * 32u + bit;
+                const auto pageBit = static_cast<std::uint32_t>(std::countr_zero(mask));
+                const auto pageIndex = pageWord * 32u + pageBit;
                 if (pageIndex >= pages) return false;
                 const auto pageAddress = (firstPage + pageIndex) << WrittenPageShift;
                 if (!hasRun) {
@@ -126,6 +160,7 @@ bool ForEachWrittenRange(const Header& header, std::span<const Range> ranges, co
                 }
                 mask &= mask - 1u;
             }
+            dirtyWords &= dirtyWords - 1u;
         }
     }
     flush();
