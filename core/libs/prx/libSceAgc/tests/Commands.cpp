@@ -622,8 +622,8 @@ void testDefaults() {
     expectFailure([] { sceAgcInit_0090(nullptr, 8); });
     expectFailure([&] { sceAgcInit_0090(&state, 14); });
     check(sceAgcInit(8) == 0, "AGC version initialization failed");
-    expectFailure([] { sceAgcInit(14); });
-    expectFailure([] { sceAgcInit(0xffffffffu); });
+    check(sceAgcInit(14) == static_cast<int>(0x80890001u), "unsupported AGC version did not return invalid argument");
+    check(sceAgcInit(0xffffffffu) == static_cast<int>(0x80890001u), "invalid AGC version did not return invalid argument");
     for (std::uint32_t version = 0; version < 14; ++version) {
         for (const bool internal : {false, true}) {
             auto* first = Agc::Command::GetRegisterDefaults(version, internal, __func__);
