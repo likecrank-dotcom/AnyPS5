@@ -1,5 +1,6 @@
 #include <Cli.hpp>
 #include <io/NativePath.hpp>
+#include <algorithm>
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
@@ -8,7 +9,7 @@
 namespace Cli {
 
 const char* Usage() {
-    return "Usage: relinker [--help] [--windows | --macos] [--windows-diagnostics] [--windows-gui] [--skip-syscall-check | --trap-sdk-syscall-stubs] [--skip-sce-module | --sce-module-path <path>] [--exclude-sce-module <file>]... [--module-dir <dir>]... [--to-intel] [--to-rosetta] [unused-filter=0|1|2] [--registry] [--rpath <path>] [--lazy-binding] [--autorun] <input.elf> <output.elf>\n"
+    return "Usage: relinker [--help] [--windows | --macos] [--windows-diagnostics] [--windows-gui] [--skip-syscall-check | --trap-sdk-syscall-stubs] [--skip-sce-module | --sce-module-path <path>] [--exclude-sce-module <file>]... [--module-dir <dir>]... [--executable <path>]... [--to-intel] [--to-rosetta] [unused-filter=0|1|2] [--registry] [--rpath <path>] [--lazy-binding] [--autorun] <input.elf> <output.elf>\n"
            "Example: relinker input.elf output.elf";
 }
 
@@ -40,6 +41,15 @@ Args ParseArgs(int argc, char* argv[]) {
             if (i + 1 >= argc)
                 throw std::runtime_error("--module-dir requires a directory");
             args.moduleDirectories.push_back(argv[++i]);
+        } else if (arg == "--executable") {
+            if (i + 1 >= argc || std::string(argv[i + 1]).empty() || std::string(argv[i + 1]).starts_with("--"))
+                throw std::runtime_error("--executable requires a relative path");
+            const std::string value = argv[++i];
+            const auto relative = std::filesystem::path(value).lexically_normal();
+            if (relative.empty() || relative == "." || relative.is_absolute() || relative.has_root_name() ||
+                std::find(relative.begin(), relative.end(), std::filesystem::path("..")) != relative.end())
+                throw std::runtime_error("--executable path must stay inside the guest app directory: " + value);
+            args.executables.push_back(value);
         } else if (arg == "--to-intel") {
             args.toIntel = true;
         } else if (arg == "--to-rosetta") {
@@ -92,6 +102,9 @@ Args ParseArgs(int argc, char* argv[]) {
     if (args.skipSceModule && !args.moduleDirectories.empty())
         throw std::runtime_error("--module-dir conflicts with --skip-sce-module");
 
+    if (args.windowsDiagnostics && !args.executables.empty())
+        throw std::runtime_error("--windows-diagnostics cannot be combined with --executable");
+
     if (args.toWindows && args.toMacos)
         throw std::runtime_error("--windows conflicts with --macos");
     if (args.toRosetta && args.toWindows)
@@ -106,7 +119,7 @@ Args ParseArgs(int argc, char* argv[]) {
         throw std::runtime_error(Usage());
 
 
-    if (!sceModulePathSpecified && !args.skipSceModule && !args.inputPath.empty()) args.sceModulePath = Io::Utf8Path(std::filesystem::absolute(Io::NativePath(args.inputPath)).parent_path());
+    if (!sceModulePathSpecified && (!args.skipSceModule || !args.executables.empty()) && !args.inputPath.empty()) args.sceModulePath = Io::Utf8Path(std::filesystem::absolute(Io::NativePath(args.inputPath)).parent_path());
 
     return args;
 }

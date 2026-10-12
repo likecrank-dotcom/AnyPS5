@@ -28,6 +28,7 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -37,6 +38,93 @@
 #endif
 
 namespace {
+
+struct SecondaryExecutable {
+    std::filesystem::path InputPath;
+    std::filesystem::path OutputPath;
+    std::vector<std::uint8_t> Bytes;
+    std::vector<Relinker::GuestArtifact> GuestArtifacts;
+    std::vector<Domain::CallRegistryEntry> RegistryEntries;
+};
+
+std::string RunPathForSecondary(const std::string& runPath, const std::filesystem::path& outputRoot, const std::filesystem::path& outputPath) {
+    if (std::filesystem::path(runPath).is_absolute()) return runPath;
+    const auto relativeRoot = std::filesystem::absolute(outputRoot).parent_path().lexically_relative(std::filesystem::absolute(outputPath).parent_path()).generic_string();
+    if (relativeRoot.empty() || relativeRoot == ".") return runPath;
+    std::string result = runPath;
+    for (std::size_t position = 0; (position = result.find("$ORIGIN", position)) != std::string::npos;) {
+        position += 7;
+        if (position != result.size() && result[position] != '/' && result[position] != ':') continue;
+        result.insert(position, "/" + relativeRoot);
+        position += relativeRoot.size() + 1;
+    }
+    return result;
+}
+
+SecondaryExecutable ConvertSecondaryExecutable(
+    const std::filesystem::path& inputPath,
+    const std::filesystem::path& outputPath,
+    const std::filesystem::path& outputRoot,
+    const Cli::Args& args,
+    const std::shared_ptr<Relinker::ISyscallScanner>& syscallScanner
+) {
+    SecondaryExecutable converted{inputPath, outputPath};
+    Io::FileReader fileReader;
+    auto sourceBytes = fileReader.Read(Io::Utf8Path(inputPath));
+    std::vector<Codegen::TrampolineSite> trampolines;
+    if (args.toIntel) {
+        const auto segments = Relinker::ElfReader(sourceBytes).ReadProgramHeaders();
+        auto intel = Codegen::MakeAmd64OnlyConverter(args.toRosetta ? Codegen::Amd64OnlyTarget::Rosetta : Codegen::Amd64OnlyTarget::Intel)->Convert(std::move(sourceBytes), segments);
+        sourceBytes = std::move(intel.Bytes);
+        trampolines = std::move(intel.Trampolines);
+    }
+    auto elfReader = std::make_shared<Relinker::ElfReader>(sourceBytes);
+    const auto pipeline = std::make_shared<Relinker::RelinkerPipeline>(
+        elfReader,
+        syscallScanner,
+        Relinker::MakeCallSiteResolver(),
+        std::make_shared<Relinker::ValidationPolicy>(),
+        std::make_shared<Relinker::SysVDynamicSectionBuilder>(),
+        args.unusedFilterLevel == 2 ? Relinker::MakeStrictUnusedNidFilter() : Relinker::MakeUnusedNidFilter(),
+        args.unusedFilterLevel
+    );
+    auto result = pipeline->Relink(sourceBytes);
+    for (const auto& patch : result.Patches) {
+        if (patch.Offset > sourceBytes.size() || patch.Bytes.size() > sourceBytes.size() - patch.Offset)
+            throw Domain::RelinkerException("Relinker patch exceeds secondary executable segment", patch.Offset);
+        for (std::size_t index = 0; index < patch.Bytes.size(); ++index) sourceBytes[patch.Offset + index] = patch.Bytes[index];
+    }
+    if (!args.skipSceModule) {
+        converted.GuestArtifacts = Relinker::GuestModuleBuilder().Build(
+            inputPath, outputPath, result.DynamicSection, args.toWindows, args.toMacos, args.toIntel, args.toRosetta,
+            *syscallScanner, args.lazyBinding, args.runPath, args.excludedSceModules, Io::NativePath(args.sceModulePath),
+            args.moduleDirectories, outputRoot
+        );
+    }
+    auto byteWriter = std::make_shared<Io::ByteWriter>();
+    std::shared_ptr<Elfpatcher::IElfPatcher> patcher;
+    if (args.toMacos) {
+        patcher = std::make_shared<Elfpatcher::MacOs::MacOsMachOPatcher>();
+    } else if (args.toWindows) {
+        patcher = std::make_shared<Elfpatcher::Windows::WindowsPePatcher>(args.windowsGui, Io::NativePath(args.inputPath).parent_path() / "sce_sys" / "icon0.png");
+    } else {
+        patcher = std::make_shared<Elfpatcher::Linux::LinuxElfPatcher>(
+            std::make_shared<Elfpatcher::EntryStubBuilder>(),
+            std::make_shared<Elfpatcher::ProgramHeaderLayoutBuilder>(std::make_shared<Elfpatcher::SegmentFilter>(), byteWriter),
+            std::make_shared<Elfpatcher::SectionHeaderTableBuilder>(byteWriter),
+            byteWriter
+        );
+    }
+    const auto runPath = RunPathForSecondary(args.runPath, outputRoot, outputPath);
+    try {
+        converted.Bytes = patcher->Patch(sourceBytes, result.OriginalHeaders, result.DynamicSection, result.OriginalPltGotVaddr, runPath, args.lazyBinding, false, trampolines);
+    } catch (Domain::RelinkerException& error) {
+        error.InputPath = Io::Utf8Path(inputPath);
+        throw;
+    }
+    converted.RegistryEntries = std::move(result.RegistryEntries);
+    return converted;
+}
 
 int Run(const int argc, char* argv[]) {
     Cli::Args args;
@@ -113,17 +201,71 @@ int Run(const int argc, char* argv[]) {
             guestArtifacts = Relinker::GuestModuleBuilder().Build(Io::NativePath(args.inputPath), Io::NativePath(absPath), result.DynamicSection, args.toWindows, args.toMacos, args.toIntel, args.toRosetta, *syscallScanner, args.lazyBinding, args.runPath, args.excludedSceModules, Io::NativePath(args.sceModulePath), args.moduleDirectories);
         }
 
+        std::vector<std::filesystem::path> secondaryInputs;
+        std::vector<std::filesystem::path> secondaryOutputPaths;
+        std::vector<std::filesystem::path> secondaryRegistryPaths;
+        std::vector<SecondaryExecutable> secondaryExecutables;
+        std::set<std::string> secondaryOutputKeys;
+        const auto outputDirectory = std::filesystem::absolute(Io::NativePath(absPath)).parent_path().lexically_normal();
+        const auto mainOutputPath = std::filesystem::absolute(Io::NativePath(absPath)).lexically_normal();
+        const auto executableRoot = Io::NativePath(args.inputPath).parent_path();
+        const auto pathKey = [&](const std::filesystem::path& path) {
+            std::string key = std::filesystem::absolute(path).lexically_normal().generic_string();
+            if (args.toWindows) for (auto& value : key) if (value >= 'A' && value <= 'Z') value = static_cast<char>(value + ('a' - 'A'));
+            return key;
+        };
+        for (const auto& name : args.executables) {
+            const auto relative = Io::NativePath(name).lexically_normal();
+            const auto input = std::filesystem::absolute(executableRoot / relative).lexically_normal();
+            const auto output = (outputDirectory / "app0" / relative).lexically_normal();
+            std::error_code fileError;
+            if (!std::filesystem::is_regular_file(input, fileError)) throw Domain::RelinkerException("Secondary executable was not found: " + name);
+            if (pathKey(output) == pathKey(mainOutputPath))
+                throw Domain::RelinkerException("Secondary executable output collides with the main executable: " + Io::Utf8Path(output));
+            if (!secondaryOutputKeys.insert(pathKey(output)).second)
+                throw Domain::RelinkerException("Conflicting secondary executable output: " + Io::Utf8Path(output));
+            if (std::filesystem::exists(output) && std::filesystem::equivalent(input, output))
+                throw Domain::RelinkerException("Secondary executable output would overwrite its input: " + Io::Utf8Path(output));
+            secondaryInputs.push_back(input);
+            secondaryOutputPaths.push_back(output);
+        }
+
         const Elfpatcher::Linux::LinuxDesktopEntryWriter desktopEntryWriter;
         const auto desktopEntry = args.toWindows || args.toMacos ? std::nullopt : desktopEntryWriter.Prepare(Io::NativePath(args.inputPath).parent_path() / "sce_sys", Io::NativePath(absPath));
 
         const auto checkOutputInputs = [&](const std::filesystem::path& path, const char* kind) {
+            if (pathKey(path) == pathKey(mainOutputPath))
+                throw Domain::RelinkerException(std::string(kind) + " output collides with the main executable: " + Io::Utf8Path(path));
+            for (const auto& artifact : guestArtifacts)
+                if (pathKey(artifact.Path) == pathKey(path))
+                    throw Domain::RelinkerException(std::string(kind) + " output collides with a guest module: " + Io::Utf8Path(path));
             if (!std::filesystem::exists(path)) return;
             if (std::filesystem::equivalent(Io::NativePath(args.inputPath), path))
                 throw Domain::RelinkerException(std::string(kind) + " output would overwrite the input executable: " + Io::Utf8Path(path));
+            for (const auto& input : secondaryInputs)
+                if (std::filesystem::equivalent(input, path))
+                    throw Domain::RelinkerException(std::string(kind) + " output would overwrite a secondary executable input: " + Io::Utf8Path(path));
             for (const auto& artifact : guestArtifacts)
                 if (std::filesystem::equivalent(artifact.SourcePath, path))
                     throw Domain::RelinkerException(std::string(kind) + " output would overwrite an input module: " + Io::Utf8Path(path));
         };
+        for (const auto& input : secondaryInputs)
+            if (pathKey(input) == pathKey(mainOutputPath) || (std::filesystem::exists(mainOutputPath) && std::filesystem::equivalent(input, mainOutputPath)))
+                throw Domain::RelinkerException("Main executable output would overwrite a secondary executable input: " + Io::Utf8Path(input));
+        for (std::size_t index = 0; index < args.executables.size(); ++index) {
+            auto converted = ConvertSecondaryExecutable(secondaryInputs[index], secondaryOutputPaths[index], Io::NativePath(absPath), args, syscallScanner);
+            for (auto& artifact : converted.GuestArtifacts) {
+                const auto existing = std::find_if(guestArtifacts.begin(), guestArtifacts.end(), [&](const auto& candidate) {
+                    return pathKey(candidate.Path) == pathKey(artifact.Path);
+                });
+                if (existing == guestArtifacts.end()) guestArtifacts.push_back(std::move(artifact));
+                else if (existing->Bytes != artifact.Bytes)
+                    throw Domain::RelinkerException("Guest module output differs between the main and secondary executables: " + Io::Utf8Path(artifact.SourcePath));
+            }
+            std::cout << "Secondary executable: " << Io::Utf8Path(converted.InputPath) << " -> " << Io::Utf8Path(converted.OutputPath) << '\n';
+            secondaryExecutables.push_back(std::move(converted));
+        }
+        for (const auto& output : secondaryOutputPaths) checkOutputInputs(output, "Secondary executable");
         if (desktopEntry) {
             checkOutputInputs(desktopEntry->IconPath, "Icon");
             checkOutputInputs(desktopEntry->EntryPath, "Desktop entry");
@@ -138,6 +280,16 @@ int Run(const int argc, char* argv[]) {
             for (const auto& artifact : guestArtifacts)
                 registryPaths.push_back(outFsPath.parent_path() / Io::NativePath(Io::Utf8Path(outFsPath.stem()) + "." + Io::Utf8Path(artifact.Path.filename()) + ".registry.json"));
             for (const auto& path : registryPaths) checkOutputInputs(path, "Registry");
+            for (const auto& executable : secondaryExecutables) {
+                const auto& output = executable.OutputPath;
+                const auto registry = output.parent_path() / Io::NativePath(Io::Utf8Path(output.stem()) + ".registry.json");
+                checkOutputInputs(registry, "Secondary executable registry");
+                secondaryRegistryPaths.push_back(registry);
+            }
+            std::set<std::string> registryKeys;
+            for (const auto& path : registryPaths) registryKeys.insert(pathKey(path));
+            for (const auto& path : secondaryRegistryPaths)
+                if (!registryKeys.insert(pathKey(path)).second) throw Domain::RelinkerException("Conflicting registry output: " + Io::Utf8Path(path));
         }
 
         auto byteWriter = std::make_shared<Io::ByteWriter>();
@@ -171,12 +323,17 @@ int Run(const int argc, char* argv[]) {
             fileWriter.Write(Io::Utf8Path(artifact.Path), artifact.Bytes);
             std::cout << "Guest module: " << Io::Utf8Path(artifact.Path) << '\n';
         }
+        for (const auto& executable : secondaryExecutables)
+            std::filesystem::create_directories(executable.OutputPath.parent_path());
         fileWriter.Write(absPath, executableBytes);
+        for (const auto& executable : secondaryExecutables) fileWriter.Write(Io::Utf8Path(executable.OutputPath), executable.Bytes);
         if (args.writeRegistry) {
             const auto registryWriter = std::make_shared<Relinker::CallRegistryWriter>();
             fileWriter.Write(Io::Utf8Path(registryPaths.front()), registryWriter->WriteCallRegistry(result.RegistryEntries));
             for (std::size_t index = 0; index < guestArtifacts.size(); ++index)
                 fileWriter.Write(Io::Utf8Path(registryPaths[index + 1]), registryWriter->WriteModuleImports(guestArtifacts[index].Imports));
+            for (std::size_t index = 0; index < secondaryExecutables.size(); ++index)
+                fileWriter.Write(Io::Utf8Path(secondaryRegistryPaths[index]), registryWriter->WriteCallRegistry(secondaryExecutables[index].RegistryEntries));
         }
         if (desktopEntry) std::cout << "Desktop entry: " << Io::Utf8Path(desktopEntryWriter.Write(*desktopEntry)) << '\n';
         std::cout << "External prx references: " << result.RegistryEntries.size() << "\nOutput file: " << absPath << '\n';

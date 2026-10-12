@@ -12,6 +12,7 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libSceSystemService/SystemService.hpp"
+#include "prx/libSceSystemService/LoadExec.hpp"
 
 namespace {
 
@@ -35,12 +36,11 @@ extern "C" {
 
 int APS5_VABI sceSystemServiceLoadExec(const char* path, const char* const* arguments) {
     if (!path || !*path) return SYSTEM_SERVICE_ERROR_PARAMETER;
-    if (std::strcmp(path, "exit") != 0) {
-        NotImplemented_nid_no_patch("sceSystemServiceLoadExec: executable replacement");
+    if (std::strcmp(path, "exit") == 0) {
+        LibcRunShutdown_nid_postfix();
+        std::exit(0);
     }
-    (void)arguments;
-    LibcRunShutdown_nid_postfix();
-    std::exit(0);
+    SystemService::ReplaceProcess(path, arguments);
 }
 
 int APS5_VABI sceSystemServiceDisableNoticeScreenSkipFlagAutoSet(void) {

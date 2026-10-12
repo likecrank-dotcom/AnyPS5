@@ -59,7 +59,7 @@ std::string ModuleStem(std::string name, const bool windows) {
 
 }
 
-std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path& inputPath, const std::filesystem::path& outputPath, Domain::SysVDynamicSection& dynamic, const bool windows, const bool macos, const bool toIntel, const bool toRosetta, ISyscallScanner& syscallScanner, const bool lazyBinding, const std::string& runPath, const std::set<std::string>& excludedModules, const std::filesystem::path& sceModulePath, const std::vector<std::string>& moduleDirectories) const {
+std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path& inputPath, const std::filesystem::path& outputPath, Domain::SysVDynamicSection& dynamic, const bool windows, const bool macos, const bool toIntel, const bool toRosetta, ISyscallScanner& syscallScanner, const bool lazyBinding, const std::string& runPath, const std::set<std::string>& excludedModules, const std::filesystem::path& sceModulePath, const std::vector<std::string>& moduleDirectories, const std::filesystem::path& artifactRoot) const {
     const auto root = std::filesystem::absolute(sceModulePath).lexically_normal();
     if (!std::filesystem::exists(root)) throw Domain::RelinkerException("Guest module parent directory does not exist: " + Io::Utf8Path(root));
     if (!std::filesystem::is_directory(root)) throw Domain::RelinkerException("Guest module parent path is not a directory: " + Io::Utf8Path(root));
@@ -329,16 +329,21 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
     for (const auto& name : neededNames) addHost(name);
     for (const auto& image : images) for (const auto& dependency : image.Dependencies) addHost(dependency);
     if (uniqueHosts.contains("libSceLibcInternal.prx") && uniqueHosts.insert("libc.prx").second) hostLibraries.push_back("libc.prx");
+    const auto outputDirectory = std::filesystem::absolute(artifactRoot.empty() ? outputPath : artifactRoot).parent_path().lexically_normal();
+    const auto executableDirectory = std::filesystem::absolute(outputPath).parent_path().lexically_normal();
     dynamic.DynamicSegmentData.clear();
     const auto addNeeded = [&](const std::string& name) {
         Io::AppendU64(dynamic.DynamicSegmentData, 1);
         Io::AppendU64(dynamic.DynamicSegmentData, dynamic.DynStrData.size());
         Io::AppendString(dynamic.DynStrData, name);
     };
-    for (const auto index : order) if (!windows && !deferred(index)) addNeeded("$ORIGIN/" + appDirectory(images[index]) + "/" + images[index].OutputName);
+    for (const auto index : order) {
+        if (windows || deferred(index)) continue;
+        const auto target = outputDirectory / appDirectory(images[index]) / images[index].OutputName;
+        addNeeded("$ORIGIN/" + target.lexically_relative(executableDirectory).generic_string());
+    }
     for (const auto& name : hostLibraries) addNeeded(name);
     if (!windows && runPath != "$ORIGIN" && !runPath.starts_with("$ORIGIN/") && !runPath.starts_with("$ORIGIN:") && !std::filesystem::path(runPath).is_absolute()) throw Domain::RelinkerException("Guest Linux run path must be absolute or begin with $ORIGIN");
-    const auto outputDirectory = std::filesystem::absolute(outputPath).parent_path().lexically_normal();
     std::vector<GuestArtifact> artifacts;
     for (const auto index : order) {
         auto& image = images[index];

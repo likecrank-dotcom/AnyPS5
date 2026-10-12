@@ -3,6 +3,7 @@
 #include "prx/libSceSystemService/SystemService.hpp"
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <stdexcept>
 #include <cstring>
 #ifdef _WIN32
@@ -47,6 +48,23 @@ int main(int argc, char** argv) {
     }
     if (argc > 1 && std::strcmp(argv[1], "--return-from-main") == 0) {
         catchReturnFromMain_nid_postfix(0);
+        return 2;
+    }
+    if (argc > 1 && std::strcmp(argv[1], "--load-exec-child") == 0) {
+        if (argc != 4 || std::filesystem::path(argv[0]).filename() != "picker.bin" ||
+            std::strcmp(argv[2], "argument with spaces") != 0 || std::strcmp(argv[3], "quote\"value") != 0) {
+            std::fprintf(stderr, "Guest executable arguments differ: argc=%d argv0=%s argv1=%s argv2=%s argv3=%s\n", argc,
+                argv[0], argc > 1 ? argv[1] : "<missing>", argc > 2 ? argv[2] : "<missing>", argc > 3 ? argv[3] : "<missing>");
+            return 3;
+        }
+        std::puts("Guest executable replacement completed with exact arguments");
+        return 0;
+    }
+    if (argc > 1 && std::strcmp(argv[1], "--load-exec") == 0) {
+        constexpr const char* arguments[] = {"--load-exec-child", "argument with spaces", "quote\"value", nullptr};
+        LibcRegisterShutdown_nid_postfix(Cleanup);
+        Require(std::atexit(VerifyExit) == 0);
+        sceSystemServiceLoadExec("/app0/picker/picker.bin", arguments);
         return 2;
     }
     if (argc > 1 && std::strcmp(argv[1], "--quick-exit") == 0) {

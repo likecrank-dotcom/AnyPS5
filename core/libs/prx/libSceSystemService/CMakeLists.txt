@@ -1,4 +1,4 @@
-add_library(libSceSystemService SHARED EXCLUDE_FROM_ALL Export.cpp)
+add_library(libSceSystemService SHARED EXCLUDE_FROM_ALL Export.cpp LoadExec.cpp)
 target_include_directories(libSceSystemService PRIVATE ${LIBS_INCLUDE_DIR})
 configure_windows_unwind(libSceSystemService)
 
@@ -12,6 +12,16 @@ if(BUILD_TESTING)
     add_test(NAME guest_quick_exit COMMAND guest_system_exit_tests --quick-exit)
     add_test(NAME guest_immediate_exit COMMAND guest_system_exit_tests --immediate)
     add_test(NAME guest_return_from_main COMMAND guest_system_exit_tests --return-from-main)
+    if(Python3_EXECUTABLE)
+        add_test(NAME guest_system_load_exec COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/test_guest_load_exec.py $<TARGET_FILE:guest_system_exit_tests>)
+        set_tests_properties(guest_system_load_exec PROPERTIES
+            PASS_REGULAR_EXPRESSION "Guest executable replacement completed with exact arguments"
+            TIMEOUT 20)
+        get_filename_component(ANYPS5_COMPILER_DIRECTORY "${CMAKE_CXX_COMPILER}" DIRECTORY)
+        set_tests_properties(guest_system_load_exec PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:${ANYPS5_COMPILER_DIRECTORY};PATH=path_list_prepend:$<TARGET_FILE_DIR:guest_system_exit_tests>;PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     set_tests_properties(guest_system_exit PROPERTIES
         PASS_REGULAR_EXPRESSION "Guest shutdown and atexit completed")
     set_tests_properties(guest_quick_exit PROPERTIES
