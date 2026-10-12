@@ -14,6 +14,7 @@ namespace {
 
 constexpr std::uint32_t FileMagic = 0x50565041u;
 constexpr std::uint32_t FileFormat = 1;
+constexpr std::uint32_t IntelVendorId = 0x8086u;
 
 struct FileHeader {
     std::uint32_t magic;
@@ -58,7 +59,11 @@ PipelineCache::PipelineCache(const Context& context, const VkPhysicalDevicePrope
         result = create(context.device, &info, nullptr, &cache);
     }
     Check(result, "vkCreatePipelineCache");
-    if (!path.empty()) saver = std::thread([this] { run(); });
+    if (!path.empty() && properties.vendorID == IntelVendorId) {
+        std::fprintf(stderr, "[pipeline-cache] Intel GPU: periodic saves disabled; saving at teardown\n");
+    } else if (!path.empty()) {
+        saver = std::thread([this] { run(); });
+    }
 }
 
 PipelineCache::~PipelineCache() {
@@ -69,8 +74,8 @@ PipelineCache::~PipelineCache() {
         }
         wake.notify_all();
         saver.join();
-        save(true);
     }
+    if (!path.empty()) save(true);
     context.Function<PFN_vkDestroyPipelineCache>("vkDestroyPipelineCache")(context.device, cache, nullptr);
 }
 
