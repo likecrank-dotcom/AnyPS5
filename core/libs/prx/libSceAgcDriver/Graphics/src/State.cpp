@@ -619,7 +619,9 @@ ShaderStages DecodeShaderStages(const QueueState& queue, bool vertexWorkgroup) {
         Require(readFloat(queue.context, 0x287) <= 1.0f && readFloat(queue.context, 0x286) >= 63.0f, "tessellation level clamps inside the fractional-odd range [1, 63] are unsupported");
         result.tessellation = tess;
     } else {
-        validate((value & ~0x0047ec30u) == 0, "unsupported geometry routing, fast launch or wave-ID state");
+        const bool fastLaunch = (value & 0x00080000u) != 0;
+        validate(!fastLaunch || (value & 0x00002030u) == 0x00002030u, "unsupported geometry fast-launch state");
+        validate((value & ~(0x0047ec30u | 0x00080000u)) == 0, "unsupported geometry routing, fast launch or wave-ID state");
         const auto group = read(queue.userConfig, 0x25b, RegisterBank::UserConfig);
         const auto vertices = (group >> 9u) & 0x1ffu;
         const auto primitives = group & 0x1ffu;

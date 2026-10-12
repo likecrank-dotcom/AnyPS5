@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "Recompiler.hpp"
 #include "execution/VulkanTestDevice.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -132,6 +133,7 @@ struct MeshDraw {
     bool restart = false;
     std::uint32_t waveSize = 64u;
     VkCullModeFlags cull = VK_CULL_MODE_NONE;
+    std::uint32_t stageValue = 0x20u;
 };
 
 bool ReadsNumWorkgroups(const std::vector<std::uint32_t>& words) {
@@ -194,7 +196,7 @@ void DrawMesh(AgcDriver::VulkanDevice& device, const MeshDraw& setup) {
     }};
 
     AgcDriver::Graphics::State state{};
-    state.stages = {AgcDriver::Graphics::ShaderPath::Geometry, 0x20u, setup.waveSize, 64, setup.mesh, std::nullopt};
+    state.stages = {AgcDriver::Graphics::ShaderPath::Geometry, setup.stageValue, setup.waveSize, 64, setup.mesh, std::nullopt};
     state.color = {reinterpret_cast<std::uintptr_t>(Pixels.data()), {Width, Height}, VK_FORMAT_R8G8B8A8_UNORM, Pixels.size(), 0xe4u};
     state.colors = {state.color};
     state.hasColorTarget = true;
@@ -332,6 +334,23 @@ int main() {
             DrawMesh(device, {subgroup, {0, static_cast<std::uint32_t>(Ordered.size()), 0, 1, 0, false}, VertexBufferDescriptor(Ordered.data(), static_cast<std::uint32_t>(Ordered.size()))});
             CheckTriangles((std::string("non-indexed triangle list, ") + name).c_str());
         }
+
+        AgcDriver::QueueState fastLaunchQueue{};
+        fastLaunchQueue.context[0x2d5] = 0x482030u;
+        fastLaunchQueue.context[0x1b6] = 0;
+        fastLaunchQueue.context[0x1ff] = 12;
+        fastLaunchQueue.context[0x2ce] = 3;
+        fastLaunchQueue.context[0x29b] = 2;
+        fastLaunchQueue.context[0x2ab] = 4;
+        fastLaunchQueue.userConfig[0x242] = 4;
+        fastLaunchQueue.userConfig[0x25b] = (12u << 9u) | 4u;
+        fastLaunchQueue.shader[0x8a] = 3u << 29u;
+        fastLaunchQueue.shader[0x8b] = (3u << 16u) | (8u << 19u);
+        const auto fastLaunch = AgcDriver::Graphics::DecodeShaderStages(fastLaunchQueue);
+        Require(fastLaunch.path == AgcDriver::Graphics::ShaderPath::Geometry && fastLaunch.mesh.has_value(), "the reported fast-launch state did not decode to a mesh draw");
+        ClearPixels();
+        DrawMesh(device, {*fastLaunch.mesh, {reinterpret_cast<std::uintptr_t>(Indices.data()), static_cast<std::uint32_t>(Indices.size()), 2, 1, 0, true}, VertexBufferDescriptor(Scrambled.data(), static_cast<std::uint32_t>(Scrambled.size())), ShaderRecompiler::MeshDrawPushOffsetBytes, false, fastLaunch.vertexWaveSize, VK_CULL_MODE_NONE, fastLaunch.registerValue});
+        CheckTriangles("GS_FAST_LAUNCH=1 indexed mesh draw");
 
         auto wave32Subgroup = SmallSubgroup;
         wave32Subgroup.threadsPerGroup = 32u;

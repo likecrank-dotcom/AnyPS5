@@ -543,6 +543,16 @@ void ShaderStageTests() {
     auto stages = AgcDriver::Graphics::DecodeState(queue).stages;
     Require(stages.path == AgcDriver::Graphics::ShaderPath::Geometry && stages.mesh && stages.mesh->primitivesPerGroup == 21 && stages.mesh->verticesPerGroup == 63, "geometry assembly changed");
     Require(stages.mesh->maxVertices == 64 && stages.mesh->maxPrimitives == 21 && stages.mesh->threadsPerGroup == 64 && stages.mesh->esgsItemSize == 4, "geometry subgroup outputs changed");
+    queue.context[0x2d5] = 0x482030u;
+    stages = AgcDriver::Graphics::DecodeState(queue).stages;
+    Require(stages.path == AgcDriver::Graphics::ShaderPath::Geometry && stages.registerValue == 0x482030u && stages.vertexWaveSize == 32u && stages.mesh.has_value(), "the reported GS_FAST_LAUNCH=1 geometry state did not decode through the mesh path");
+    Require(stages.mesh->inputPrimitive == 4u && stages.mesh->primitivesPerGroup == 21u && stages.mesh->verticesPerGroup == 63u && stages.mesh->maxVertices == 64u, "GS_FAST_LAUNCH=1 changed geometry draw assembly");
+    auto unsupportedFastLaunch = queue;
+    unsupportedFastLaunch.context[0x2d5] = 0x582030u;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(unsupportedFastLaunch); }, "unsupported geometry routing");
+    unsupportedFastLaunch.context[0x2d5] = 0x480020u;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(unsupportedFastLaunch); }, "unsupported geometry fast-launch state");
+    queue.context[0x2d5] = 0x2020u;
     {
         auto fan = makeState();
         fan.userConfig[0x242] = 5;
