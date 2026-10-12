@@ -165,6 +165,9 @@ static void TestParentTraversal() {
         checkInvalid(root.generic_string() + "/dangling-link/..", 2);
     }
     Require(chdir_nid_postfix(root.generic_string().c_str()) == 0);
+#ifdef _WIN32
+    Require(fopen_nid_postfix("victim", "rb") == nullptr && *__error_nid_postfix() == EACCES);
+#endif
     Require(sceKernelStat("missing/../present.txt", &status) == static_cast<int>(0x80020002u));
     Require(sceKernelStat("present.txt/..", &status) == static_cast<int>(0x80020014u));
     Require(sceKernelStat("EXISTING/../present.txt", &status) == 0 && status.st_size == 9);

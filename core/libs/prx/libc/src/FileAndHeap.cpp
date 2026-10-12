@@ -34,7 +34,6 @@
 struct GuestFileMode {
     std::string native;
     bool writes = false;
-    bool exclusive = false;
     bool append = false;
 };
 
@@ -48,7 +47,7 @@ static std::optional<GuestFileMode> ParseFileMode(const char* mode) {
         if (*flag == 'x') exclusive = true;
     }
     if (exclusive && access == 'r' && !update) return std::nullopt;
-    GuestFileMode result{std::string(1, access), access != 'r' || update, exclusive, access == 'a'};
+    GuestFileMode result{std::string(1, access), access != 'r' || update, access == 'a'};
     if (update) result.native += '+';
 #ifdef _WIN32
     result.native += 'b';
@@ -244,31 +243,8 @@ FileStream* APS5_VABI fopen_nid_postfix(const char* filename, const char* mode) 
     }
     std::filesystem::path fpath;
     if (const int error = ResolvePathError_nid_no_patch(filename, fpath)) { errno = error; return nullptr; }
-    const auto abs_path = fpath.string();
     std::unique_ptr<std::FILE, int (*)(std::FILE*)> handle(OpenNative(fpath, parsed->native), std::fclose);
-    if (!handle) {
-        const int error = errno;
-        if (error == ENOENT || (parsed->exclusive && error == EEXIST)) {
-            errno = error;
-            return nullptr;
-        }
-        const auto reason = std::strerror(error);
-        std::error_code ec;
-        std::filesystem::path sibling;
-        for (const auto& entry : std::filesystem::directory_iterator(fpath.parent_path(), ec)) {
-            if (ec) break;
-            if (entry.path().stem() == fpath.stem() && entry.path().extension() != fpath.extension()) {
-                sibling = std::filesystem::absolute(entry.path());
-                break;
-            }
-        }
-        if (!sibling.empty()) {
-            // APS5_LOG_OUT("%s: \"%s\": %s. Sibling: \"%s\"", FOPEN_MSG_NOT_FOUND, abs_path.c_str(), reason, sibling.filename().string().c_str());
-            return nullptr;
-        }
-        throw std::runtime_error(std::string(__func__) + ": " + FOPEN_MSG_OPEN_FAILED + ": \"" + abs_path + "\": " + reason);
-    }
-    // APS5_LOG_OUT("success: \"%s\"", abs_path.c_str());
+    if (!handle) return nullptr;
     if (parsed->append) static_cast<void>(std::fseek(handle.get(), 0, SEEK_END));
     if (parsed->writes) RecordWrittenPath_nid_no_patch(fpath);
     auto stream = std::make_unique<FileStream>(handle.get(), true);
@@ -278,12 +254,11 @@ FileStream* APS5_VABI fopen_nid_postfix(const char* filename, const char* mode) 
 
 int APS5_VABI fopen_s_nid_postfix(FileStream** result, const char* filename, const char* mode) {
     constexpr int GuestEinval = 22;
-    constexpr int GuestEnoent = 2;
     if (!result) return GuestEinval;
     *result = nullptr;
     if (!filename || !mode) return GuestEinval;
     *result = fopen_nid_postfix(filename, mode);
-    return *result ? 0 : GuestEnoent;
+    return *result ? 0 : errno;
 }
 
 int APS5_VABI fclose_nid_postfix(FileStream* stream) {

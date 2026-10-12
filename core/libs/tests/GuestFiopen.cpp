@@ -2,6 +2,7 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include <cstdint>
 #include <cstdio>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -83,6 +84,11 @@ int main() {
     checkedStream = &_Stdout_nid_postfix;
     Require(fopen_s_nid_postfix(&checkedStream, missing, "rb") == GuestEnoent);
     Require(checkedStream == nullptr);
+#ifdef _WIN32
+    checkedStream = nullptr;
+    Require(fopen_s_nid_postfix(&checkedStream, dir.string().c_str(), "rb") == EACCES);
+    Require(checkedStream == nullptr);
+#endif
 
     auto* stream = Open(file, In);
     Require(stream != nullptr && std::fgetc(stream->GetHandle()) == 'a');
