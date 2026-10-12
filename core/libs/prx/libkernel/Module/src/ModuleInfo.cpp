@@ -397,6 +397,23 @@ int APS5_VABI sceKernelGetModuleInfo(KernelModule handle, ModuleInfo* info) {
     return SCE_KERNEL_ERROR_ESRCH;
 }
 
+int APS5_VABI sceKernelGetLibkernelTextLocation(std::uint64_t* address, std::uint64_t* size) {
+    if (!address || !size) return SCE_KERNEL_ERROR_EFAULT;
+    ModuleInfoEx info{};
+    info.st_size = sizeof(ModuleInfoEx);
+    const auto functionAddress = reinterpret_cast<std::uintptr_t>(&sceKernelGetLibkernelTextLocation);
+    const int result = sceKernelGetModuleInfoFromAddr(functionAddress, 2, &info);
+    if (result != 0) return result;
+    for (std::uint32_t i = 0; i < info.segment_count; ++i) {
+        const auto& segment = info.segments[i];
+        if ((segment.prot & ProtExecute) == 0 || functionAddress < segment.address || functionAddress - segment.address >= segment.size) continue;
+        *address = segment.address;
+        *size = segment.size;
+        return 0;
+    }
+    throw std::runtime_error("sceKernelGetLibkernelTextLocation: no executable segment contains the function");
+}
+
 std::uint64_t GuestImageSegmentBytes_nid_no_patch() {
     return GuestSegmentBytes();
 }

@@ -16,6 +16,7 @@ int APS5_VABI dlclose_nid_postfix(void*);
 int APS5_VABI sceKernelGetModuleInfoFromAddr(std::uint64_t, int, ModuleInfoEx*);
 int APS5_VABI sceKernelGetModuleList(KernelModule*, std::size_t, std::size_t*);
 int APS5_VABI sceKernelGetModuleInfo(KernelModule, ModuleInfo*);
+int APS5_VABI sceKernelGetLibkernelTextLocation(std::uint64_t*, std::uint64_t*);
 }
 static void Require(bool value) { if (!value) std::abort(); }
 template<typename TFunction>
@@ -80,6 +81,20 @@ int main(int argc, char** argv) {
     Require(sceKernelGetModuleList(nullptr, 0, &untouched) == SCE_KERNEL_ERROR_EFAULT);
     Require(sceKernelGetModuleList(handles.data(), handles.size(), nullptr) == SCE_KERNEL_ERROR_EFAULT);
     const auto kernelEx = Query(reinterpret_cast<const void*>(&sceKernelGetModuleInfo), 0);
+    std::uint64_t textAddress = 0;
+    std::uint64_t textSize = 0;
+    Require(sceKernelGetLibkernelTextLocation(&textAddress, &textSize) == 0);
+    bool textSegmentFound = false;
+    const auto textInfo = Query(reinterpret_cast<const void*>(textAddress), 0);
+    Require(std::string(textInfo.name) == "libkernel.prx");
+    for (std::uint32_t i = 0; i < textInfo.segment_count; ++i) {
+        const auto& segment = textInfo.segments[i];
+        if ((segment.prot & 5) == 5 && textAddress == segment.address && textSize == segment.size) textSegmentFound = true;
+    }
+    Require(textSegmentFound);
+    std::uint64_t unchanged = 0x1234;
+    Require(sceKernelGetLibkernelTextLocation(&unchanged, nullptr) == SCE_KERNEL_ERROR_EFAULT && unchanged == 0x1234);
+    Require(sceKernelGetLibkernelTextLocation(nullptr, &unchanged) == SCE_KERNEL_ERROR_EFAULT && unchanged == 0x1234);
     ModuleInfo kernelInfo{};
     kernelInfo.st_size = sizeof(ModuleInfo);
     Require(sceKernelGetModuleInfo(kernel, &kernelInfo) == 0);
