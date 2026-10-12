@@ -1,12 +1,14 @@
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "VulkanTestDevice.hpp"
 #include <SDL_loadso.h>
@@ -17,6 +19,7 @@
 #include <windows.h>
 #endif
 #include <array>
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -24,6 +27,7 @@
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <span>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -39,6 +43,10 @@ constexpr std::uint32_t Side = 256;
 constexpr std::uint32_t Format32UInt = 20;
 constexpr std::uint32_t TileR64KBX = 0x1b;
 constexpr std::uint32_t Type2D = 9;
+constexpr std::uint32_t TypeCube = 11;
+constexpr std::uint32_t CubeSide = 128;
+constexpr std::uint32_t CubeLevels = 8;
+constexpr std::uint32_t CubeFaces = 6;
 constexpr std::size_t SurfaceBytes = std::size_t{Side} * Side * 4u;
 constexpr std::size_t Surfaces = 12;
 constexpr std::size_t BlockBytes = SurfaceBytes * Surfaces;
@@ -193,14 +201,14 @@ private:
     void* memory = nullptr;
 };
 
-std::array<std::uint32_t, 8> Descriptor(std::uint64_t address, std::uint32_t side = Side) {
+std::array<std::uint32_t, 8> Descriptor(std::uint64_t address, std::uint32_t side = Side, std::uint32_t type = Type2D, std::uint32_t mipCount = 1, std::uint32_t depth = 0) {
     return {
         static_cast<std::uint32_t>(address >> 8u),
         static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (Format32UInt << 20u) | (((side - 1u) & 3u) << 30u),
         ((side - 1u) >> 2u) | ((side - 1u) << 14u),
-        0xfacu | (TileR64KBX << 20u) | (Type2D << 28u),
-        0u,
-        0u,
+        0xfacu | (TileR64KBX << 20u) | ((mipCount - 1u) << 16u) | (type << 28u),
+        depth,
+        (mipCount - 1u) << 4u,
         0u,
         0u,
     };
@@ -424,6 +432,118 @@ void heldTests(const Context& context) {
     Require(TextureCacheUsage().sampledEntries == capacity && TextureCacheUsage().sampledBytes <= Budget, "released textures were not evicted down to the budget");
 }
 
+bool cubeVisibilityTests(const Context& context) {
+    Block block(context);
+    ClearCachedTextures(context.device);
+    if (context.hostImportAlignment == 0 || HostImportFor(context, block.Surface(0), BlockBytes) == nullptr) {
+        std::puts("host import unavailable: cached cube visibility not tested");
+        return false;
+    }
+    const auto base = block.Surface(0);
+    const auto cubeWords = Descriptor(base, CubeSide, TypeCube, CubeLevels, CubeFaces - 1u);
+    const auto cubeResource = DecodeTextureResource(cubeWords);
+    const auto cubeGeometry = DescribeSurface(cubeResource);
+    const auto faceGeometry = DescribeSurface(DecodeTextureResource(Descriptor(base, CubeSide, Type2D, CubeLevels)));
+    Require(cubeGeometry.layers == CubeFaces && cubeGeometry.layerBytes == faceGeometry.layerBytes && cubeGeometry.guestBytes <= BlockBytes,
+            "cube and 2D face descriptors do not describe the expected packed-tail surface");
+
+    AgcDriver::GuestMemory::CollectWrites(base, static_cast<std::size_t>(cubeGeometry.guestBytes));
+    auto first = CachedSampledTexture(context, cubeWords);
+    Require(first->ViewsStorageImage() && first->SharedStorageSource() != nullptr,
+            "the initial cube sampled view is not backed by a storage image");
+
+    std::array<std::shared_ptr<StorageTexture>, CubeFaces> faces;
+    for (std::uint32_t layer = 0; layer < CubeFaces; ++layer) {
+        const auto words = Descriptor(base + layer * cubeGeometry.layerBytes, CubeSide, Type2D, CubeLevels);
+        faces[layer] = CachedStorageSurface(context, DecodeTextureResource(words));
+    }
+
+    CommandBatch clearBatch(context);
+    const auto clearColor = context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage");
+    for (std::uint32_t layer = 0; layer < CubeFaces; ++layer) {
+        for (std::uint32_t level = 0; level < CubeLevels; ++level) {
+            VkClearColorValue value{};
+            value.uint32[0] = 0x10000u + layer * 0x100u + level;
+            const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, level, 1u, 0u, 1u};
+            clearColor(clearBatch.Handle(), faces[layer]->Image(), VK_IMAGE_LAYOUT_GENERAL, &value, 1u, &range);
+        }
+        faces[layer]->MarkDirty();
+    }
+    clearBatch.SubmitAndWait();
+
+    const auto again = CachedSampledTexture(context, cubeWords);
+    Require(again == first, "the second cube lookup did not hit the sampled-view cache");
+    const auto image = again->SharedStorageSource();
+    Require(image != nullptr, "the cached cube view lost its storage image");
+
+    const auto mips = ComputeElementMipLayout(TextureTileMode::kR64KBX, 4u, CubeSide, CubeSide, CubeLevels);
+    const ColorTargetLayout tailLayout(CubeSide, CubeSide, ColorTileMode::RenderTarget, 4u);
+    const auto guestOffset = static_cast<std::size_t>(cubeGeometry.layerBytes + mips[2].tiledOffset + tailLayout.Offset(mips[2].tailX, mips[2].tailY));
+    std::uint32_t guestValue = 0;
+    AgcDriver::GuestMemory::Read(base + guestOffset, std::as_writable_bytes(std::span(&guestValue, 1u)));
+    Require(guestValue == 0x10102u,
+            "face 1 mip 2 write-back stored " + std::to_string(guestValue) + " in guest memory, expected 65794");
+    const auto* import = HostImportFor(context, base, static_cast<std::size_t>(cubeGeometry.guestBytes));
+    Require(import != nullptr, "the cube guest memory lost its host import after write-back");
+    Buffer importedReadback(context, sizeof(std::uint32_t), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    CommandBatch importBatch(context);
+    RecordMemoryBarrier(context, importBatch.Handle(), VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    CopyBuffer(context, importBatch.Handle(), import->buffer, base + guestOffset - import->base, importedReadback.Handle(), 0, sizeof(std::uint32_t));
+    importBatch.SubmitAndWait();
+    importedReadback.Invalidate();
+    std::uint32_t importedValue = 0;
+    std::memcpy(&importedValue, importedReadback.Bytes().data(), sizeof(importedValue));
+    Require(importedValue == 0x10102u,
+            "face 1 mip 2 host import contains " + std::to_string(importedValue) + " after write-back, expected 65794");
+
+    std::vector<VkBufferImageCopy> copies;
+    std::vector<std::pair<std::size_t, std::uint32_t>> checks;
+    std::size_t totalBytes = 0;
+    for (std::uint32_t layer = 0; layer < CubeFaces; ++layer) {
+        for (std::uint32_t level = 0; level < CubeLevels; ++level) {
+            const auto width = std::max(CubeSide >> level, 1u);
+            VkBufferImageCopy copy{};
+            copy.bufferOffset = totalBytes;
+            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1u};
+            copy.imageExtent = {width, width, 1u};
+            copies.push_back(copy);
+            checks.emplace_back(totalBytes / sizeof(std::uint32_t), 0x10000u + layer * 0x100u + level);
+            totalBytes += static_cast<std::size_t>(width) * width * sizeof(std::uint32_t);
+        }
+    }
+    Buffer readback(context, totalBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    CommandBatch readBatch(context);
+    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = image->Image();
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, CubeLevels, 0u, CubeFaces};
+    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(readBatch.Handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0u, 0u, nullptr, 0u, nullptr, 1u, &barrier);
+    context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(readBatch.Handle(), image->Image(), VK_IMAGE_LAYOUT_GENERAL, readback.Handle(), static_cast<std::uint32_t>(copies.size()), copies.data());
+    readBatch.SubmitAndWait();
+    readback.Invalidate();
+    const auto* words = reinterpret_cast<const std::uint32_t*>(readback.Bytes().data());
+    for (const auto& [firstWord, expected] : checks) {
+        const auto level = expected & 0xffu;
+        const auto layer = (expected >> 8u) & 0xffu;
+        const auto texels = static_cast<std::size_t>(std::max(CubeSide >> level, 1u)) * std::max(CubeSide >> level, 1u);
+        for (std::size_t texel = 0; texel < texels; ++texel) {
+            const auto actual = words[firstWord + texel];
+            Require(actual == expected,
+                    "cached cube sampled image has value " + std::to_string(actual) + " at face " + std::to_string(layer) + " mip " + std::to_string(level) + ", expected " + std::to_string(expected));
+        }
+    }
+
+    faces.fill(nullptr);
+    first.reset();
+    ClearCachedTextures(context.device);
+    return true;
+}
+
 void rescanTests(const Context& context) {
     constexpr std::uint32_t SmallSide = 128;
     constexpr std::size_t SmallBytes = std::size_t{SmallSide} * SmallSide * 4u;
@@ -603,11 +723,13 @@ int main(int argc, char** argv) {
     try {
         const bool memory = argc > 1 && std::string(argv[1]) == "memory";
         const std::string mode = argc > 1 ? argv[1] : "";
+        const bool cubeVisibility = mode == "cube-visibility";
+        const bool cubeVisibilityBuffer = mode == "cube-visibility-buffer";
         const bool resources = mode == "resource-admission" || mode == "resource-oversized" || mode == "resource-clear";
 #ifdef _WIN32
-        if (!memory) _putenv_s("APS5_TEXTURE_CACHE_MIB", "1");
+        if (!memory && !cubeVisibility && !cubeVisibilityBuffer) _putenv_s("APS5_TEXTURE_CACHE_MIB", "1");
 #else
-        if (!memory) setenv("APS5_TEXTURE_CACHE_MIB", "1", 1);
+        if (!memory && !cubeVisibility && !cubeVisibilityBuffer) setenv("APS5_TEXTURE_CACHE_MIB", "1", 1);
 #endif
         std::unique_ptr<Device> device;
         try {
@@ -620,6 +742,7 @@ int main(int argc, char** argv) {
         auto context = device->GetContext();
         TextureDetiler detiler(context);
         context.detiler = &detiler;
+        if (cubeVisibilityBuffer) context.singlePassStorage = false;
         if (resources) {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             if (!resourceCacheTests(context, mode)) return VulkanTestSkipped;
@@ -631,6 +754,12 @@ int main(int argc, char** argv) {
             memoryTests(context);
             ClearCachedTextures(context.device);
             std::puts("sampled texture memory budget tests passed");
+            return 0;
+        }
+        if (cubeVisibility || cubeVisibilityBuffer) {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            if (!cubeVisibilityTests(context)) return VulkanTestSkipped;
+            std::puts("packed-tail cube visibility tests passed");
             return 0;
         }
         {
