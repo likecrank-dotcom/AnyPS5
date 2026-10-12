@@ -7,6 +7,7 @@
 #include <cstring>
 #include <initializer_list>
 #include <limits>
+#include <memory>
 #include <set>
 #include <string>
 #include <utility>
@@ -96,40 +97,53 @@ private:
 
 static void RunWrittenRangeDecodeTests() {
     namespace Abi = ShaderRecompiler::BdaAbi;
-    std::vector<std::uint32_t> words(Abi::FaultBufferBytes / sizeof(std::uint32_t));
+    constexpr std::uint64_t page = std::uint64_t{1} << Abi::WrittenPageShift;
+    constexpr std::uint64_t top = 0x7ffffffe0000ULL;
+    std::array<Abi::Range, 2> ranges{{
+        {0x200000001000ULL, 0x200000002000ULL, 0x2000, Abi::Read, Abi::NoWrittenBitmap},
+        {top, top + 4 * page, 0x1000, Abi::Read | Abi::Write, 0},
+    }};
+    Abi::Header header{Abi::Version, static_cast<std::uint32_t>(ranges.size()), sizeof(Abi::Range), 1};
+    std::vector<std::uint32_t> words(Abi::WrittenBitmapWord + 1);
     std::vector<std::pair<std::uint64_t, std::size_t>> marked;
     const auto decode = [&] {
         marked.clear();
-        return Abi::ForEachWrittenRange(words.data(), [&](std::uint64_t address, std::size_t bytes) { marked.emplace_back(address, bytes); });
+        return Abi::ForEachWrittenRange(header, ranges, words.data(), words.size(), [&](std::uint64_t address, std::size_t bytes) { marked.emplace_back(address, bytes); });
     };
-    const auto claim = [&](std::uint32_t index, std::uint32_t slot, std::uint64_t address, std::uint32_t mask) {
-        words[Abi::WrittenListWord + index] = slot;
-        words[Abi::WrittenSlotsWord + 2 * slot] = Abi::WrittenChunkKey(address);
-        words[Abi::WrittenSlotsWord + 2 * slot + 1] = mask;
-        words[Abi::WrittenCountWord] = std::max(words[Abi::WrittenCountWord], index + 1);
-    };
-    constexpr std::uint64_t page = std::uint64_t{1} << Abi::WrittenPageShift;
     Require(decode() && marked.empty(), "an empty written-page record marked pages");
-    constexpr std::uint64_t top = 0x7ffffffe0000ULL;
-    claim(0, 5, top, 0b1011u);
+    words[Abi::WrittenBitmapWord] = 0b1011u;
     Require(decode() && marked == std::vector<std::pair<std::uint64_t, std::size_t>>{{top, 2 * page}, {top + 3 * page, page}}, "written pages near the top of the address space were not decoded as written");
     std::fill(words.begin(), words.end(), 0u);
-    constexpr std::uint64_t high = 0x200000001000ULL;
-    claim(0, Abi::WrittenPageSlots - 1, high, 1u << ((high >> Abi::WrittenPageShift) & (Abi::WrittenChunkPages - 1u)));
-    Require(decode() && marked == std::vector<std::pair<std::uint64_t, std::size_t>>{{high, page}}, "a written page above 16 TiB was decoded at another address");
-    std::fill(words.begin(), words.end(), 0u);
-    constexpr std::uint64_t chunk = 0x3e0000000ULL;
-    claim(0, 7, chunk, 0xffffffffu);
-    claim(1, 8, chunk + (std::uint64_t{1} << Abi::WrittenChunkShift), 1u);
-    claim(2, 9, chunk - (std::uint64_t{1} << Abi::WrittenChunkShift), 0x80000000u);
-    Require(decode() && marked == std::vector<std::pair<std::uint64_t, std::size_t>>{{chunk, 32 * page}, {chunk + 32 * page, page}, {chunk - page, page}}, "whole, first-page and last-page chunks were not decoded exactly");
-    words[Abi::WrittenListWord + 1] = Abi::WrittenPageSlots;
-    Require(!decode(), "a claim outside the slots was accepted");
-    std::fill(words.begin(), words.end(), 0u);
-    words[Abi::WrittenCountWord] = 1;
-    Require(!decode(), "a claim of an empty slot was accepted");
-    words[Abi::WrittenCountWord] = Abi::WrittenPageSlots + 1;
-    Require(!decode(), "more claims than slots were accepted");
+    ranges[0].permissions = Abi::Read | Abi::Write;
+    ranges[0].reserved = 0;
+    ranges[1].permissions = Abi::Read;
+    ranges[1].reserved = Abi::NoWrittenBitmap;
+    header.reserved = 1;
+    words[Abi::WrittenBitmapWord] = 1;
+    Require(decode() && marked == std::vector<std::pair<std::uint64_t, std::size_t>>{{ranges[0].begin, page}}, "a written page above 16 TiB was decoded at another address");
+    words[Abi::WrittenBitmapWord] = 2;
+    Require(!decode(), "bitmap bits beyond the mapped pages were accepted");
+    words[Abi::WrittenBitmapWord] = 1;
+    ranges[0].reserved = 1;
+    Require(!decode(), "a noncontiguous bitmap offset was accepted");
+    ranges[0].reserved = 0;
+    Require(!Abi::ForEachWrittenRange(header, ranges, words.data(), Abi::WrittenBitmapWord, [](std::uint64_t, std::size_t) {}), "a truncated bitmap buffer was accepted");
+
+    constexpr std::uint32_t manyRangesCount = 2049;
+    std::vector<Abi::Range> manyRanges;
+    manyRanges.reserve(manyRangesCount);
+    for (std::uint32_t index = 0; index < manyRangesCount; ++index) {
+        const auto begin = 0x100000000ULL + static_cast<std::uint64_t>(index) * 2u * page;
+        manyRanges.push_back({begin, begin + page, 0x1000u + static_cast<std::uint64_t>(index) * page, Abi::Read | Abi::Write, index});
+    }
+    Abi::Header manyHeader{Abi::Version, manyRangesCount, sizeof(Abi::Range), manyRangesCount};
+    std::vector<std::uint32_t> manyWords(Abi::WrittenBitmapWord + manyRangesCount);
+    manyWords[Abi::WrittenBitmapWord] = 1u;
+    manyWords[Abi::WrittenBitmapWord + manyRangesCount - 1u] = 1u;
+    marked.clear();
+    Require(Abi::ForEachWrittenRange(manyHeader, manyRanges, manyWords.data(), manyWords.size(), [&](std::uint64_t address, std::size_t bytes) { marked.emplace_back(address, bytes); }) &&
+        marked == std::vector<std::pair<std::uint64_t, std::size_t>>{{manyRanges.front().begin, page}, {manyRanges.back().begin, page}},
+        "written-page decoding capped a valid bitmap at the old 2048 tracker slots");
 }
 
 static void RunBdaDwordWriteTests(const Context& context) {
@@ -142,11 +156,11 @@ static void RunBdaDwordWriteTests(const Context& context) {
     Buffer readOnly(context, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
     const std::array<Abi::Range, 3> ranges{{
         {guest, guest + firstBytes, first.DeviceAddress(), Abi::Read | Abi::Write, 0},
-        {guest + firstBytes, guest + firstBytes + 16, second.DeviceAddress(), Abi::Read | Abi::Write, 0},
-        {guest + firstBytes + 16, guest + firstBytes + 32, readOnly.DeviceAddress(), Abi::Read, 0},
+        {guest + firstBytes, guest + firstBytes + 16, second.DeviceAddress(), Abi::Read | Abi::Write, 1},
+        {guest + firstBytes + 16, guest + firstBytes + 32, readOnly.DeviceAddress(), Abi::Read, Abi::NoWrittenBitmap},
     }};
     Buffer table(context, sizeof(Abi::Header) + sizeof(ranges), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    Buffer fault(context, Abi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer fault(context, Abi::FaultBufferBytes + 2 * sizeof(std::uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     Buffer output(context, 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     const std::array<std::uint32_t, 4> values{0x11223344u, 0x55667788u, 0x99aabbccu, 0xddeeff00u};
     const auto bytesAt = [&](std::uint64_t address) -> std::byte* {
@@ -160,14 +174,16 @@ static void RunBdaDwordWriteTests(const Context& context) {
     const auto notedBytes = [&](std::uint64_t first, std::uint64_t last) {
         std::uint64_t covered = 0, total = 0;
         const auto* faultWords = reinterpret_cast<const std::uint32_t*>(fault.Bytes().data());
-        Require(Abi::ForEachWrittenRange(faultWords, [&](std::uint64_t begin, std::size_t bytes) {
+        const Abi::Header header{Abi::Version, static_cast<std::uint32_t>(ranges.size()), sizeof(Abi::Range), 2};
+        const auto* rangeData = reinterpret_cast<const Abi::Range*>(table.Bytes().data() + sizeof(Abi::Header));
+        Require(Abi::ForEachWrittenRange(header, std::span<const Abi::Range>(rangeData, ranges.size()), faultWords, fault.Bytes().size() / sizeof(std::uint32_t), [&](std::uint64_t begin, std::size_t bytes) {
             total += bytes;
             for (const auto address : {first, last}) covered += address >= begin && address < begin + bytes ? 1u : 0u;
         }), "a BDA dword write left an invalid written-page record");
         return std::pair{covered, total};
     };
     const auto write = [&](std::uint64_t address, std::uint32_t dwords, std::uint32_t storedBytes, Abi::FaultReason reason, std::uint32_t groups = 1) {
-        const Abi::Header header{Abi::Version, static_cast<std::uint32_t>(ranges.size()), sizeof(Abi::Range), 0};
+        const Abi::Header header{Abi::Version, static_cast<std::uint32_t>(ranges.size()), sizeof(Abi::Range), 2};
         std::memcpy(table.Bytes().data(), &header, sizeof(header));
         std::memcpy(table.Bytes().data() + sizeof(header), ranges.data(), sizeof(ranges));
         std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
@@ -194,10 +210,6 @@ static void RunBdaDwordWriteTests(const Context& context) {
         } else {
             const auto pages = ((address + storedBytes - 1u) >> Abi::WrittenPageShift) - (address >> Abi::WrittenPageShift) + 1u;
             Require(covered == 2 && total == pages << Abi::WrittenPageShift, "a BDA dword write did not note exactly its written pages");
-            const auto chunks = ((address + storedBytes - 1u) >> Abi::WrittenChunkShift) - (address >> Abi::WrittenChunkShift) + 1u;
-            std::uint32_t claims = 0;
-            std::memcpy(&claims, fault.Bytes().data() + Abi::WrittenCountWord * sizeof(std::uint32_t), sizeof(claims));
-            Require(claims == chunks, "a BDA dword write claimed a written-page slot more than once per chunk");
         }
     };
     write(guest + 16, 4, 16, static_cast<Abi::FaultReason>(0));
@@ -215,6 +227,44 @@ static void RunBdaDwordWriteTests(const Context& context) {
 
 void RunBdaExecutionTests(const Context& context) {
     namespace Abi = ShaderRecompiler::BdaAbi;
+    std::vector<std::uint64_t> collidingAddresses;
+    constexpr std::size_t collisionCount = 9;
+    for (std::uint32_t key = 1; collidingAddresses.size() < collisionCount; ++key) {
+        if (((key * 0x9e3779b1u) >> 21u) != 0u) continue;
+        collidingAddresses.push_back((static_cast<std::uint64_t>(key - 1u) << 17u) + 0x100u);
+    }
+    std::vector<std::unique_ptr<Buffer>> collidingBuffers;
+    std::vector<Abi::Range> collidingRanges;
+    std::uint32_t bitmapWords = 0;
+    for (const auto address : collidingAddresses) {
+        collidingBuffers.push_back(std::make_unique<Buffer>(context, 8, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT));
+        collidingRanges.push_back({address, address + 8u, collidingBuffers.back()->DeviceAddress(), Abi::Read | Abi::Write, bitmapWords++});
+        std::fill(collidingBuffers.back()->Bytes().begin(), collidingBuffers.back()->Bytes().end(), std::byte{0xa5});
+    }
+    Buffer collisionTable(context, sizeof(Abi::Header) + collidingRanges.size() * sizeof(Abi::Range), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer collisionFault(context, Abi::FaultBufferBytes + bitmapWords * sizeof(std::uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer collisionOutput(context, 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    const Abi::Header collisionHeader{Abi::Version, static_cast<std::uint32_t>(collidingRanges.size()), sizeof(Abi::Range), bitmapWords};
+    std::memcpy(collisionTable.Bytes().data(), &collisionHeader, sizeof(collisionHeader));
+    std::memcpy(collisionTable.Bytes().data() + sizeof(collisionHeader), collidingRanges.data(), collidingRanges.size() * sizeof(Abi::Range));
+    const std::array<Buffer*, 3> collisionDescriptors{&collisionTable, &collisionFault, &collisionOutput};
+    const auto collisionShader = MakeBdaCollidingChunkWriteTestShader(collidingAddresses);
+    Pipeline collisionPipeline(context, collisionShader, collisionDescriptors);
+    collisionPipeline.Run(1);
+    const auto* collisionWords = reinterpret_cast<const std::uint32_t*>(collisionFault.Bytes().data());
+    Require(collisionWords[Abi::WrittenOverflowWord] == 0u, "BDA bitmap tracking overflowed for nine pages whose old hash keys collided");
+    std::set<std::uint64_t> collisionPages;
+    Require(Abi::ForEachWrittenRange(collisionHeader, collidingRanges, collisionWords, collisionFault.Bytes().size() / sizeof(std::uint32_t), [&](std::uint64_t address, std::size_t bytes) {
+        for (std::size_t offset = 0; offset < bytes; offset += std::size_t{1} << Abi::WrittenPageShift) collisionPages.insert((address + offset) >> Abi::WrittenPageShift);
+    }), "BDA collision test produced an invalid page bitmap");
+    std::set<std::uint64_t> expectedCollisionPages;
+    for (const auto address : collidingAddresses) expectedCollisionPages.insert(address >> Abi::WrittenPageShift);
+    Require(collisionPages == expectedCollisionPages, "BDA bitmap tracking lost pages whose old hash keys collided");
+    for (const auto& buffer : collidingBuffers) {
+        std::array<std::uint32_t, 2> actual{};
+        std::memcpy(actual.data(), buffer->Bytes().data(), sizeof(actual));
+        Require(actual == std::array<std::uint32_t, 2>{0x12345678u, 0x9abcdef0u}, "a colliding BDA write failed to reach guest memory");
+    }
     Buffer first(context, 3, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
     Buffer second(context, 2, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
     first.Bytes()[0] = std::byte{0x11};
@@ -223,7 +273,7 @@ void RunBdaExecutionTests(const Context& context) {
     second.Bytes()[0] = std::byte{0x44};
     second.Bytes()[1] = std::byte{0x55};
     constexpr std::uint64_t guest = 0x7fff12340001ULL;
-    std::array<Abi::Range, 2> ranges{{{guest, guest + 3, first.DeviceAddress(), Abi::Read, 0}, {guest + 3, guest + 5, second.DeviceAddress(), Abi::Read, 0}}};
+    std::array<Abi::Range, 2> ranges{{{guest, guest + 3, first.DeviceAddress(), Abi::Read, Abi::NoWrittenBitmap}, {guest + 3, guest + 5, second.DeviceAddress(), Abi::Read, Abi::NoWrittenBitmap}}};
     Buffer table(context, sizeof(Abi::Header) + sizeof(ranges), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     Buffer fault(context, sizeof(Abi::Fault), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     Buffer output(context, 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -295,7 +345,7 @@ void RunBdaExecutionTests(const Context& context) {
         std::memcpy(wide.Bytes().data() + dword * 4u, &value, sizeof(value));
     }
     constexpr std::uint64_t spanGuest = 0x7fff56780000ULL;
-    const std::array<Abi::Range, 3> spanRanges{{ranges[0], ranges[1], {spanGuest, spanGuest + 32, wide.DeviceAddress(), Abi::Read, 0}}};
+    const std::array<Abi::Range, 3> spanRanges{{ranges[0], ranges[1], {spanGuest, spanGuest + 32, wide.DeviceAddress(), Abi::Read, Abi::NoWrittenBitmap}}};
     Buffer spanTable(context, sizeof(Abi::Header) + sizeof(spanRanges), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     const auto span = [&](std::uint64_t address, std::int32_t offset, std::uint32_t extracted, bool coherent, bool stops, std::array<std::uint32_t, 4> values, Abi::FaultReason reason = {}, std::uint64_t faultAddress = 0, std::uint32_t faultBytes = 0) {
         const Abi::Header header{Abi::Version, 3, sizeof(Abi::Range), 0};
@@ -331,6 +381,7 @@ void RunBdaExecutionTests(const Context& context) {
         }
     }
     ranges[0].permissions = 0;
+    ranges[0].reserved = Abi::NoWrittenBitmap;
     run(guest, 8, 0, Abi::FaultReason::Permission);
     RunBdaDwordWriteTests(context);
 }
@@ -340,15 +391,24 @@ void RunBdaStoreExecutionTests(const Context& context) {
     Buffer first(context, 2, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
     Buffer second(context, 3, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
     Buffer table(context, sizeof(Abi::Header) + 2 * sizeof(Abi::Range), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    Buffer fault(context, Abi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer fault(context, Abi::FaultBufferBytes + 4 * sizeof(std::uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     Buffer output(context, 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     constexpr std::uint64_t guest = 0x7fff1235fffdULL;
     constexpr std::uint32_t writable = Abi::Read | Abi::Write;
-    const Abi::Header header{Abi::Version, 2, sizeof(Abi::Range), 0};
     std::array<Abi::Range, 2> ranges{};
     bool runtime = false;
     const auto run = [&](const char* name, std::uint64_t address, std::uint32_t bits, bool coherent, const std::array<std::uint8_t, 5>& expected, std::initializer_list<std::uint64_t> writtenAddresses, Abi::FaultReason reason = {}, std::uint64_t faultAddress = 0, std::uint32_t faultBytes = 0) {
         const std::string label = std::string(runtime ? "BDA runtime write " : "BDA store ") + name + (coherent ? " coherent: " : ": ");
+        std::uint32_t bitmapWords = 0;
+        for (auto& range : ranges) {
+            if ((range.permissions & Abi::Write) == 0) {
+                range.reserved = Abi::NoWrittenBitmap;
+            } else {
+                range.reserved = bitmapWords;
+                bitmapWords += static_cast<std::uint32_t>(Abi::WrittenBitmapWordCount(range));
+            }
+        }
+        const Abi::Header header{Abi::Version, 2, sizeof(Abi::Range), bitmapWords};
         std::memset(first.Bytes().data(), 0xcd, first.Bytes().size());
         std::memset(second.Bytes().data(), 0xcd, second.Bytes().size());
         std::memcpy(table.Bytes().data(), &header, sizeof(header));
@@ -368,23 +428,21 @@ void RunBdaStoreExecutionTests(const Context& context) {
         } else {
             Require(report.state == Abi::FaultState::Ready && report.reason == reason && report.address == faultAddress && report.bytes == faultBytes && report.stage == static_cast<std::uint32_t>(ShaderRecompiler::IrShaderStage::Compute) && report.instruction == 0x1234 && report.reserved == 0, label + "incorrect first fault metadata");
         }
-        std::array<std::uint32_t, Abi::FaultBufferBytes / sizeof(std::uint32_t)> words{};
-        std::memcpy(words.data(), fault.Bytes().data(), sizeof(words));
+        std::vector<std::uint32_t> words(fault.Bytes().size() / sizeof(std::uint32_t));
+        std::memcpy(words.data(), fault.Bytes().data(), words.size() * sizeof(words.front()));
         Require(words[Abi::WrittenOverflowWord] == 0, label + "written-page table overflowed");
         std::set<std::uint64_t> recordedPages;
-        Require(Abi::ForEachWrittenRange(words.data(), [&](std::uint64_t address, std::size_t bytes) {
+        const auto decoded = Abi::ForEachWrittenRange(header, ranges, words.data(), fault.Bytes().size() / sizeof(std::uint32_t), [&](std::uint64_t address, std::size_t bytes) {
             for (std::size_t offset = 0; offset < bytes; offset += std::size_t{1} << Abi::WrittenPageShift) {
                 Require(recordedPages.insert((address + offset) >> Abi::WrittenPageShift).second, label + "written-page table contains duplicate pages");
             }
-        }), label + "invalid written-page record");
+        });
+        Require(decoded, label + "invalid written-page record");
         std::set<std::uint64_t> expectedPages;
-        std::set<std::uint32_t> expectedChunks;
         for (const auto writtenAddress : writtenAddresses) {
             expectedPages.insert(writtenAddress >> Abi::WrittenPageShift);
-            expectedChunks.insert(Abi::WrittenChunkKey(writtenAddress));
         }
         Require(recordedPages == expectedPages, label + "incorrect written-page set");
-        Require(words[Abi::WrittenCountWord] == expectedChunks.size(), label + "incorrect written-chunk claim count");
         std::uint32_t completed = 0;
         std::memcpy(&completed, output.Bytes().data(), sizeof(completed));
         Require(completed == 1, label + "store did not finish its per-byte accesses");

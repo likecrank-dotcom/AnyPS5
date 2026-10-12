@@ -44,6 +44,7 @@ private:
     std::shared_ptr<Buffer> table;
     std::unique_ptr<Buffer> fault;
     std::size_t tableBytes = 0;
+    std::size_t faultBytes = 0;
 };
 
 }

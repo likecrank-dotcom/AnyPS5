@@ -218,6 +218,7 @@ function(add_shader_recompiler target runtimeTarget)
             BuildBarycentricGeometryShader
             BuildPreparedShaderKey
             BuildRectListShaders
+            BdaAbi::WrittenBitmapWordCount
             CaptureResources
             DebugProbeActive
             DepthBitsTextureWidth

@@ -102,6 +102,19 @@ std::vector<std::uint32_t> MakeBdaDwordWriteTestShader(std::uint64_t address, st
     }, 0u, true);
 }
 
+std::vector<std::uint32_t> MakeBdaCollidingChunkWriteTestShader(std::span<const std::uint64_t> addresses) {
+    using namespace ShaderRecompiler;
+    return MakeShader(addresses.empty() ? 0u : addresses.front(), false, true, [&](SpirvValueEmitContext& ctx, const IrValue& instruction, std::uint32_t) {
+        auto& state = ctx.state;
+        const auto first = ConstantU32(state, 0x12345678u);
+        const auto second = ConstantU32(state, 0x9abcdef0u);
+        const auto composite = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 2u), composite, first, second);
+        for (const auto address : addresses) EmitBdaDwordWrites(ctx, instruction, BdaConstant(state, address), 0u, 2u, composite);
+        return std::vector<std::uint32_t>{ConstantU32(state, 1u)};
+    }, 0u, true);
+}
+
 std::vector<std::uint32_t> MakeBdaDwordReadTestShader(std::uint64_t address, std::uint32_t dwords, bool coherent, bool stops) {
     using namespace ShaderRecompiler;
     return MakeShader(address, coherent, stops, [&](SpirvValueEmitContext& ctx, const IrValue& instruction, std::uint32_t base) {

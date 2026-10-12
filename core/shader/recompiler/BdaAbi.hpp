@@ -4,11 +4,12 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <type_traits>
 
 namespace ShaderRecompiler::BdaAbi {
 
-inline constexpr std::uint32_t Version = 1;
+inline constexpr std::uint32_t Version = 2;
 inline constexpr std::uint32_t Read = 1;
 inline constexpr std::uint32_t Write = 2;
 
@@ -47,43 +48,87 @@ static_assert(std::is_standard_layout_v<Fault> && std::is_trivially_copyable_v<F
 static_assert(offsetof(Fault, address) == 8 && offsetof(Fault, instruction) == 24);
 
 inline constexpr std::uint32_t WrittenPageShift = 12;
-inline constexpr std::uint32_t WrittenChunkShift = 17;
-inline constexpr std::uint32_t WrittenChunkPages = 1u << (WrittenChunkShift - WrittenPageShift);
-inline constexpr std::uint32_t WrittenPageSlots = 2048;
-inline constexpr std::uint32_t WrittenPageProbes = 8;
-inline constexpr std::uint64_t WrittenAddressLimit = std::uint64_t{0xffffffffu} << WrittenChunkShift;
+inline constexpr std::uint64_t WrittenAddressLimit = std::uint64_t{1} << 48;
 inline constexpr std::uint32_t WrittenOverflowWord = sizeof(Fault) / sizeof(std::uint32_t);
-inline constexpr std::uint32_t WrittenCountWord = WrittenOverflowWord + 1;
-inline constexpr std::uint32_t WrittenSlotsWord = WrittenCountWord + 1;
-inline constexpr std::uint32_t WrittenListWord = WrittenSlotsWord + 2 * WrittenPageSlots;
-inline constexpr std::size_t FaultBufferBytes = (WrittenListWord + WrittenPageSlots) * sizeof(std::uint32_t);
-static_assert((WrittenPageSlots & (WrittenPageSlots - 1)) == 0);
-static_assert(WrittenChunkPages == 32);
+inline constexpr std::size_t FaultBufferBytes = (WrittenOverflowWord + 1u) * sizeof(std::uint32_t);
+inline constexpr std::uint32_t WrittenBitmapWord = static_cast<std::uint32_t>(FaultBufferBytes / sizeof(std::uint32_t));
+inline constexpr std::uint32_t NoWrittenBitmap = UINT32_MAX;
+inline constexpr std::uint64_t WrittenPageBytes = std::uint64_t{1} << WrittenPageShift;
+static_assert(WrittenBitmapWord * sizeof(std::uint32_t) == FaultBufferBytes);
 
-inline constexpr std::uint32_t WrittenChunkKey(std::uint64_t address) {
-    return static_cast<std::uint32_t>(address >> WrittenChunkShift) + 1u;
+inline constexpr std::uint64_t WrittenBitmapPageCount(const Range& range) {
+    return range.end <= range.begin ? 0 : ((range.end - 1u) >> WrittenPageShift) - (range.begin >> WrittenPageShift) + 1u;
+}
+
+inline constexpr std::uint64_t WrittenBitmapWordCount(const Range& range) {
+    const auto pages = WrittenBitmapPageCount(range);
+    return (pages + 31u) / 32u;
 }
 
 template<typename TMark>
-bool ForEachWrittenRange(const std::uint32_t* words, TMark&& mark) {
-    const auto count = words[WrittenCountWord];
-    if (count > WrittenPageSlots) return false;
-    for (std::uint32_t claim = 0; claim < count; ++claim) {
-        const auto slot = words[WrittenListWord + claim];
-        if (slot >= WrittenPageSlots || words[WrittenSlotsWord + 2 * slot] == 0) return false;
-    }
-    for (std::uint32_t claim = 0; claim < count; ++claim) {
-        const auto slot = words[WrittenListWord + claim];
-        const auto key = words[WrittenSlotsWord + 2 * slot];
-        auto mask = words[WrittenSlotsWord + 2 * slot + 1];
-        const auto base = static_cast<std::uint64_t>(key - 1u) << WrittenChunkShift;
-        while (mask != 0) {
-            const auto first = static_cast<std::uint32_t>(std::countr_zero(mask));
-            const auto pages = static_cast<std::uint32_t>(std::countr_one(mask >> first));
-            mark(base + (static_cast<std::uint64_t>(first) << WrittenPageShift), static_cast<std::size_t>(pages) << WrittenPageShift);
-            mask = pages + first >= 32u ? 0u : mask & ~((1u << (first + pages)) - 1u);
+bool ForEachWrittenRange(const Header& header, std::span<const Range> ranges, const std::uint32_t* words, std::size_t wordCount, TMark&& mark) {
+    if (header.version != Version || header.entryBytes != sizeof(Range) || header.count != ranges.size()) return false;
+    if (wordCount < WrittenBitmapWord || header.reserved > wordCount - WrittenBitmapWord) return false;
+    std::uint64_t expectedBitmapWord = 0;
+    std::uint64_t previousEnd = 0;
+    for (const auto& range : ranges) {
+        if (range.begin >= range.end || range.begin < previousEnd) return false;
+        previousEnd = range.end;
+        if ((range.permissions & Write) == 0) {
+            if (range.reserved != NoWrittenBitmap) return false;
+            continue;
+        }
+        if (range.end > WrittenAddressLimit || range.reserved != expectedBitmapWord) return false;
+        const auto bitmapWords = WrittenBitmapWordCount(range);
+        if (bitmapWords > header.reserved - expectedBitmapWord) return false;
+        expectedBitmapWord += bitmapWords;
+        const auto pages = WrittenBitmapPageCount(range);
+        const auto finalPageBits = static_cast<std::uint32_t>(pages & 31u);
+        if (finalPageBits != 0u && bitmapWords != 0u) {
+            const auto last = words[WrittenBitmapWord + range.reserved + bitmapWords - 1u];
+            if ((last >> finalPageBits) != 0u) return false;
         }
     }
+    if (expectedBitmapWord != header.reserved) return false;
+
+    bool hasRun = false;
+    std::uint64_t runBegin = 0;
+    std::uint64_t lastPage = 0;
+    const auto flush = [&] {
+        if (!hasRun) return;
+        mark(runBegin, static_cast<std::size_t>(lastPage - runBegin + WrittenPageBytes));
+        hasRun = false;
+    };
+    for (const auto& range : ranges) {
+        if ((range.permissions & Write) == 0) continue;
+        const auto firstPage = range.begin >> WrittenPageShift;
+        const auto pages = WrittenBitmapPageCount(range);
+        const auto bitmapWords = WrittenBitmapWordCount(range);
+        for (std::uint64_t word = 0; word < bitmapWords; ++word) {
+            auto mask = words[WrittenBitmapWord + range.reserved + word];
+            while (mask != 0u) {
+                const auto bit = static_cast<std::uint32_t>(std::countr_zero(mask));
+                const auto pageIndex = word * 32u + bit;
+                if (pageIndex >= pages) return false;
+                const auto pageAddress = (firstPage + pageIndex) << WrittenPageShift;
+                if (!hasRun) {
+                    runBegin = lastPage = pageAddress;
+                    hasRun = true;
+                } else if (pageAddress == lastPage) {
+                } else if (pageAddress == lastPage + WrittenPageBytes) {
+                    lastPage = pageAddress;
+                } else if (pageAddress > lastPage) {
+                    flush();
+                    runBegin = lastPage = pageAddress;
+                    hasRun = true;
+                } else {
+                    return false;
+                }
+                mask &= mask - 1u;
+            }
+        }
+    }
+    flush();
     return true;
 }
 
